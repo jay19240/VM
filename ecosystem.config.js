@@ -15,7 +15,7 @@ module.exports = {
       watch: true,
       ignore_watch: ["node_modules", ".next", "dist"],
       env: {
-        PORT: 4000
+        PORT: 5173
       }
     }
   ]

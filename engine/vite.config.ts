@@ -8,6 +8,11 @@ import { viteStaticCopy } from 'vite-plugin-static-copy';
 export default defineConfig(({ mode }) => {
   if (mode == 'development') {
     return {
+      server: {
+        allowedHosts: [
+          'legacy-engine.io'
+        ]
+      },
       plugins: [
         FullReload(['public/**'])
       ],
@@ -74,6 +79,11 @@ export default defineConfig(({ mode }) => {
   }
 
   return {
+    server: {
+      allowedHosts: [
+        'legacy-engine.io'
+      ]
+    },
     publicDir: false,
     plugins: [
       wasm(),
