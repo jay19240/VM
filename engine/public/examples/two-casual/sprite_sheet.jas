@@ -1,0 +1,44 @@
+{
+  "Ident": "JAS",
+  "Animations": [
+    {
+      "Name": "BOOM",
+      "Frames": [
+        { "X": 292, "Y": 312, "Width": 60, "Height": 75 },
+        { "X": 283, "Y": 385, "Width": 60, "Height": 75 },
+        { "X": 339, "Y": 164, "Width": 60, "Height": 75 },
+        { "X": 299, "Y": 241, "Width": 60, "Height": 75 },
+        { "X": 277, "Y": 164, "Width": 60, "Height": 75 },
+        { "X": 237, "Y": 242, "Width": 60, "Height": 75 },
+        { "X": 221, "Y": 394, "Width": 60, "Height": 75 },
+        { "X": 215, "Y": 165, "Width": 60, "Height": 75 },
+        { "X": 153, "Y": 165, "Width": 60, "Height": 75 }
+      ],
+      "FrameDuration": 100
+    },
+    {
+      "Name": "EXPLOSION_SMALL",
+      "Frames": [
+        { "X": 449, "Y": 180, "Width": 46, "Height": 47 },
+        { "X": 454, "Y": 132, "Width": 46, "Height": 47 },
+        { "X": 346, "Y": 423, "Width": 40, "Height": 41 },
+        { "X": 345, "Y": 380, "Width": 40, "Height": 41 },
+        { "X": 401, "Y": 164, "Width": 46, "Height": 47 },
+        { "X": 361, "Y": 241, "Width": 46, "Height": 47 },
+        { "X": 298, "Y": 462, "Width": 46, "Height": 47 }
+
+      ],
+      "FrameDuration": 100
+    },
+    {
+      "Name": "UFO",
+      "Frames": [
+        { "X": 407, "Y": 132, "Width": 45, "Height": 30 },
+        { "X": 360, "Y": 132, "Width": 45, "Height": 30 },
+        { "X": 313, "Y": 132, "Width": 45, "Height": 30 },
+        { "X": 266, "Y": 132, "Width": 45, "Height": 30 }
+      ],
+      "FrameDuration": 100
+    }
+  ]
+}

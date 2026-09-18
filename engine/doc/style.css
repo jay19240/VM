@@ -1,0 +1,344 @@
+/*
+THEME NAME: Irrlicht
+THEME URI: https://irrlicht.sourceforge.io/
+DESCRIPTION: Theme for the Irrlicht Engine's website
+VERSION: 1.0
+AUTHOR: Irrlicht Engine Team 
+AUTHOR URI: https://irrlicht.sourceforge.io/
+TAGS: blue, microformats, flexible-width, two-columns, left-sidebar
+*/
+
+/* Set the font and background colour */
+
+body.wordpress {
+background-color:#BBBBBB;
+font-family:Verdana,Arial,Helvetica,sans-serif;
+text-align:center;
+}
+
+#wrapper
+{
+-webkit-border-top-left-radius: 4px;
+-webkit-border-top-right-radius: 2px;
+-webkit-border-bottom-right-radius: 2px;
+-webkit-border-bottom-left-radius: 6px;
+-moz-border-radius-topleft: 4px;
+-moz-border-radius-topright: 2px;
+-moz-border-radius-bottomright: 2px;
+-moz-border-radius-bottomleft: 6px;
+border-top-left-radius: 4px;
+border-top-right-radius: 2px;
+border-bottom-right-radius: 2px;
+border-bottom-left-radius: 6px;
+}
+/* Then set the page colour and default font etc */
+
+div.hfeed {
+background-color:#FFFFFF;
+border:1px solid #000000;
+font-size:11px;
+width:90%;
+text-align:left;
+margin:30px auto;
+}
+
+/* links are fancy */
+a {
+color:#004666;
+}
+a:hover {
+color:#00D1AB;
+}
+
+
+/* Two-column with sidebar on left */
+
+div#container {
+float:right;
+margin:0 0 0 -150px;
+width:100%;
+height:100%;
+}
+
+div#content {
+margin:0 0 0 150px;
+height:100%;
+background-color: #fff;
+}
+
+div.sidebar {
+background-color:#EEEEEE;
+border-bottom:1px solid #000000;
+border-right:1px solid #999999;
+padding:5px;
+vertical-align:top;
+width:139px;
+}
+
+/* disable bullet points and indents on sidebar lists */
+
+div.sidebar a {
+color:#004666;
+display:block;
+font-weight:normal;
+margin:0;
+padding:2px 5px 2px 2px;
+text-decoration:none;
+}
+
+div.sidebar a:hover {
+background:none repeat scroll 0 0 #007AB3;
+color:#FFFFFF;
+}
+
+div.sidebar ul.xoxo
+{
+list-style-type: none;
+padding: 0 6px;
+font-size:13px;
+display:block;
+}
+
+h3.widgettitle
+{
+font-weight:bold;
+margin:0 10px 0 5px;
+margin:0;
+padding:5px 0;
+font-size:13px;
+}
+
+div#secondary {
+clear:left;
+}
+
+div#footer {
+clear:both;
+width:100%;
+}
+
+/* articles not as wide as the main page */
+
+div.post, div.page {
+padding:10px;
+}
+div#comments {
+padding:10px;
+}
+
+/* images in news posts float on the left */
+div.post img, div.page img.newsimage {
+margin-left:10px;
+margin-right:10px;
+float:left;
+}
+
+/* h3 in articles headlines is a nice bar across the top */
+
+div#content h3 {
+vertical-align:top;
+background-color:#007AB3;
+color:#FFFFFF;
+font-weight:bold;
+text-align:left;
+padding: 0 5px;
+}
+
+div#content h3 a {
+color:#FFFFFF;
+text-decoration: none;
+}
+
+span.entry-date {
+font-weight:normal;
+text-align:center;
+padding:0 30px;
+}
+
+#header
+{
+	height:74px;
+	width:100%;
+	background: #000 url("/images/irrlicht_header_loop.png") repeat-x;
+}
+
+div.logobar {
+width:370px;
+float:left;
+height:74px;
+}
+
+div.logobar img
+{
+	border:0;
+	width:370px;
+	height:74px;
+}
+
+div.linkbar {
+float:right;
+width: 300px;
+background: #000 url("/images/irrlicht_header_loop.png") repeat-x;
+padding-right:10px;
+padding-top:55px;
+text-align:right;
+font-size:11px;
+line-height:1.5em;
+}
+
+div.linkbar ul {
+margin:0;
+}
+
+div.linkbar a {
+color:#FFFFFF;
+font-weight:bold;
+text-decoration:none;
+}
+
+div.linkbar a:hover {
+color:#00D1AB;
+font-weight:bold;
+}
+
+div.linkbar li {
+display: inline;
+list-style-type: none;
+}
+
+h2.page-title {
+padding-left:10px;
+}
+
+table.borderedbox {
+background-color:#EEEEEE;
+border:1px solid #000000;
+margin-left:10px;
+vertical-align:top;
+width:95%;
+border-spacing:0px;
+}
+
+table.borderedbox td {
+border:1px solid #000000;
+}
+
+table.borderedbox th {
+border:1px solid #000000;
+vertical-align:top;
+background-color:#007AB3;
+color:#FFFFFF;
+font-weight:bold;
+text-align:left;
+}
+
+table td {
+vertical-align:top;
+}
+
+div.post img.wp-smiley {
+float: none
+}
+
+/* Post information goes on the right, so it doesn't interfere with the picture */
+
+div.entry-meta {
+text-align:right
+}
+
+/* resize post images and remove their border */
+img.irrlicht-post-image {
+border: 0px;
+width: 120px;
+height: 80px;
+}
+
+/* navigation */
+div.nav-next {
+text-align:right;
+}
+
+table.irr-navbar {
+width: 100%
+}
+
+table.irr-navbar.td {
+width: 50%
+}
+
+/* Menu */
+.xoxo {
+margin: 0 0 15px 0;
+}
+
+ul.menu {
+padding: 0;
+margin: 0 0 0 10px;
+}
+
+li.menu-item, li.widget_nav_menu, ul.menu, ul.oxo, li.widget {
+list-style-type: none;
+}
+
+li.menu-item {
+padding: 0px;
+margin: 0px;
+}
+
+h3.widgettitle {
+border-left:0px;
+padding:0px;
+margin: 12px 0 0 0;
+}
+
+
+/* infobox on project pages */
+.infobox {
+position: relative;
+display: inline-block;
+width: 135px;
+border: 1px solid;
+padding: 2px 2px 2px 2px;
+margin: 10px 5px;
+text-align: center
+}
+
+.irrlicht-project-image {
+width: 100%;
+}
+
+
+/* Wordpress gallery */
+
+.gallery {
+display: block;
+clear: both;
+overflow: hidden;
+margin: 0 auto;
+}
+.gallery .gallery-row {
+display:block;
+clear: both;
+overflow: hidden;
+margin: 0;
+}
+.gallery .gallery-item {
+overflow: hidden;
+float: left;
+margin: 0;
+text-align: center;
+list-style: none;
+padding: 0;
+position: absolute;
+bottom: 0;
+}
+.gallery .gallery-item img, .gallery .gallery-item img.thumbnail {
+max-width: 89%;
+height: auto;
+padding: 1%;
+margin: 0 auto;
+}
+.gallery-caption {
+margin-left: 0;
+}
+

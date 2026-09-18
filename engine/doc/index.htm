@@ -1,0 +1,198 @@
+<html>
+<head>
+    <title>ArcadeGPU - Documentation</title>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <link rel="stylesheet" href="api-styles.css">
+    <script src="data.js"></script>
+</head>
+<body>
+    <div class="schema">
+        <table width="100%" class="schema-table">
+            <tbody>
+                <tr class="bgColor6">
+                    <th width="100%" colspan="15" onclick="loadModule('ENGINE')">ENGINE</th>
+                </tr>
+                <tr class="bgColor2">
+                    <th width="1%" colspan="1" class="bgColor4"></th>
+                    <th width="1%" colspan="1" class="bgColor4"></th>
+                    <th width="15%" colspan="2" class="bgColor1">
+                        <div class="schema-table-mod" onclick="loadModule('GFX2')">GFX2</div>
+                        <div class="schema-table-mod" onclick="loadModule('GFX2_FONT')">GFX2_FONT</div>
+                        <div class="schema-table-mod" onclick="loadModule('GFX2_SPRITE')">GFX2_SPRITE</div>
+                        <div class="schema-table-mod" onclick="loadModule('GFX2_PARTICLES')">GFX2_PARTICLES</div>
+                        <div class="schema-table-mod" onclick="loadModule('GFX2_TILE')">GFX2_TILE</div>
+                        <div class="schema-table-mod" onclick="loadModule('GFX2_TILE_ISO')">GFX2_TILE_ISO</div>
+                    </th>
+                    <th width="20%" colspan="3" class="bgColor1">
+                        <div class="schema-table-mod" onclick="loadModule('GFX3')">GFX3</div>
+                        <div class="schema-table-mod" onclick="loadModule('GFX3_CAMERA')">GFX3_CAMERA</div>
+                        <div class="schema-table-mod" onclick="loadModule('GFX3_FLARE')">GFX3_FLARE</div>
+                        <div class="schema-table-mod" onclick="loadModule('GFX3_MESH')">GFX3_MESH</div>
+                        <div class="schema-table-mod" onclick="loadModule('GFX3_NOISE')">GFX3_NOISE</div>
+                        <div class="schema-table-mod" onclick="loadModule('GFX3_PARTICLES')">GFX3_PARTICLES</div>
+                        <div class="schema-table-mod" onclick="loadModule('GFX3_PHYSICS')">GFX3_PHYSICS</div>
+                        <div class="schema-table-mod" onclick="loadModule('GFX3_POST')">GFX3_POST</div>
+                        <div class="schema-table-mod" onclick="loadModule('GFX3_SHADOW_VOLUME')">GFX3_SHADOW_VOLUME</div>
+                        <div class="schema-table-mod" onclick="loadModule('GFX3_SKYBOX')">GFX3_SKYBOX</div>
+                        <div class="schema-table-mod" onclick="loadModule('GFX3_SPRITE')">GFX3_SPRITE</div>
+                        <div class="schema-table-mod" onclick="loadModule('GFX3_TRAIL')">GFX3_TRAIL</div>
+                        <div class="schema-table-mod" onclick="loadModule('GFX3_WATER')">GFX3_WATER</div>
+                    </th>
+                    <th width="1%" colspan="1" class="bgColor4"></th>
+                    <th width="1%" colspan="1" class="bgColor4"></th>
+                    <th width="1%" colspan="1" class="bgColor4"></th>
+                    <th width="1%" colspan="1" class="bgColor4"></th>
+                    <th width="1%" colspan="1" class="bgColor4"></th>
+                    <th width="20%" colspan="2" class="bgColor1">
+                        <div class="schema-table-mod" onclick="loadModule('UI')">UI</div>
+                        <div class="schema-table-mod" onclick="loadModule('UI_BUBBLE')">UI_BUBBLE</div>
+                        <div class="schema-table-mod" onclick="loadModule('UI_CONFETTI')">UI_CONFETTI</div>
+                        <div class="schema-table-mod" onclick="loadModule('UI_DESCRIPTION_LIST')">UI_DESCRIPTION_LIST</div>
+                        <div class="schema-table-mod" onclick="loadModule('UI_DIALOG')">UI_DIALOG</div>
+                        <div class="schema-table-mod" onclick="loadModule('UI_INPUT')">UI_INPUT</div>
+                        <div class="schema-table-mod" onclick="loadModule('UI_INPUT_KEYBOARD')">UI_INPUT_KEYBOARD</div>
+                        <div class="schema-table-mod" onclick="loadModule('UI_INPUT_SLIDER')">UI_INPUT_SLIDER</div>
+                        <div class="schema-table-mod" onclick="loadModule('UI_MENU')">UI_MENU</div>
+                        <div class="schema-table-mod" onclick="loadModule('UI_MENU_LIST_VIEW')">UI_MENU_LIST_VIEW</div>
+                        <div class="schema-table-mod" onclick="loadModule('UI_MENU_TEXT')">UI_MENU_TEXT</div>
+                        <div class="schema-table-mod" onclick="loadModule('UI_MESSAGE')">UI_MESSAGE</div>
+                        <div class="schema-table-mod" onclick="loadModule('UI_PRINT')">UI_PRINT</div>
+                        <div class="schema-table-mod" onclick="loadModule('UI_PROMPT')">UI_PROMPT</div>
+                        <div class="schema-table-mod" onclick="loadModule('UI_SPRITE')">UI_SPRITE</div>
+                        <div class="schema-table-mod" onclick="loadModule('UI_TEXT')">UI_TEXT</div>
+                    </th>
+                </tr>
+                <tr class="bgColor2">
+                    <th width="1%" colspan="1" class="bgColor1" onclick="loadModule('AI')">AI</th>
+                    <th width="1%" colspan="1" class="bgColor1" onclick="loadModule('DNA')">DNA</th>
+                    <th width="15%" colspan="2" class="bgColor4">GFX2</th>
+                    <th width="20%" colspan="3" class="bgColor4">GFX3</th>
+                    <th width="1%" colspan="1" class="bgColor1" onclick="loadModule('INPUT')">INPUT</th>
+                    <th width="1%" colspan="1" class="bgColor1" onclick="loadModule('MOTION')">MOTION</th>
+                    <th width="1%" colspan="1" class="bgColor1" onclick="loadModule('SCREEN')">SCREEN</th>
+                    <th width="1%" colspan="1" class="bgColor1" onclick="loadModule('SCRIPT')">SCRIPT</th>
+                    <th width="1%" colspan="1" class="bgColor1" onclick="loadModule('SOUND')">SOUND</th>
+                    <th width="20%" colspan="2" class="bgColor4">UI</th>
+                </tr>
+                <tr class="bgColor1">
+                    <th width="100%" colspan="15">
+                        <span onclick="loadModule('CORE')">CORE</span> ·
+                        <span onclick="loadModule('TYPES')">TYPES</span>
+                    </th>
+                </tr>
+                <tr class="bgColor0">
+                    <th width="100%" colspan="15" class="js-classes"></th>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+    <div class="module">
+        <span class="js-class-name"></span>
+        <p class="module-title">
+            <span class="js-class-description"></span>
+        </p>
+        <div class="module-content js-methods"></div>
+    </div>
+</body>
+<script>
+    loadModule('AI');
+    loadClass('AIMinMaxSolver<T>');
+
+    function echapperHTML(texte) {
+        const tableEntites = {
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            '"': '&quot;',
+            "'": '&#39;'
+        };
+        
+        return texte.replace(/[&<>"']/g, (caractere) => tableEntites[caractere]);
+    }
+
+    function formaterDescription(texte) {
+        return echapperHTML(texte || '').replace(/\n/g, '<br>');
+    }
+
+    function loadModule(moduleName) {
+        const module = modules.data.find(module => module.name == moduleName);
+        if (!module) {
+            return;
+        }
+
+        let str = '';
+        for (const c of module.classes) {
+            str += `<a href="#" onclick="loadClass('${c.name}'); return false;" class="module-class">${c.kind || 'Classe'} ${echapperHTML(c.name)}</a>`;
+        }
+
+        document.querySelector('.js-classes').innerHTML = str;
+        currentModule = module.name;
+    }
+
+    function loadClass(className) {
+        const module = modules.data.find(module => module.name == currentModule);
+        if (!module) {
+            return;
+        }
+
+        let c = module.classes.find(c => c.name == className);
+        if (!c) {
+            return;
+        }
+
+        let str = '';
+
+        for (const m of c.methods) {
+            str += `<div class="module-f">`;
+
+            if (m.abstract) {
+                str += `<span class="hljs-keyword module-t">${m.abstract ? `abstract ` : ''}</span>`;
+            }
+
+            if (m.static) {
+                str += `<span class="hljs-keyword module-t">${m.static ? `static ` : ''}</span>`;
+            }
+
+            if (m.async) {
+                str += `<span class="hljs-keyword module-t">${m.async ? `async ` : ''}</span>`;
+            }
+
+            str += `<span class="hljs-keyword module-t">${m.kind ? m.kind + ' ' : ''}</span>`;
+            str += `<b aria-describedby="description">${echapperHTML(m.name)}</b>`;
+            str += `<div role="tooltip" id="description">`;
+            str += `<p>${formaterDescription(m.description)}</p>`;
+            str += `<ul>`;
+
+            for (let i = 0; i < m.parameters.length; i++) {
+                str += `<li>${echapperHTML(m.parameters[i].name)} : ${formaterDescription(m.parameters[i].description)}</li>`;
+            }
+
+            if (m.return_description) {
+                str += `<li>retour : ${formaterDescription(m.return_description)}</li>`;
+            }
+
+            str += `</ul>`;
+            str += `</div>`;
+
+            if (['propriété', 'valeur', 'type'].includes(m.kind)) {
+                str += `<span>${m.return_type ? ': ' + echapperHTML(m.return_type) : ''};</span>`;
+            }
+            else {
+                str += `(`;
+
+                for (let i = 0; i < m.parameters.length; i++) {
+                    str += `${echapperHTML(m.parameters[i].name)}: <span class="hljs-keyword">${echapperHTML(m.parameters[i].type)}</span>` + (i < m.parameters.length - 1 ? `, ` : '');
+                }
+
+                str += `)<span>${m.return_type ? ': ' + echapperHTML(m.return_type) : ''};</span>`;
+            }
+            str += `</div>`;
+        }
+
+        document.querySelector('.js-class-name').textContent = (c.kind ? c.kind + ' ' : '') + c.name + (c.parent ? ' - hérite de ' + c.parent : '');
+        document.querySelector('.js-class-description').textContent = c.description;
+        document.querySelector('.js-methods').innerHTML = str;
+        currentClass = className;
+    }
+</script>
+</html>

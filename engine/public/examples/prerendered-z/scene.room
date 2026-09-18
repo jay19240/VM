@@ -1,0 +1,34 @@
+{
+  "Ident": "ROOM",
+  "Id": "Room0000",
+  "Name": "Sample With ZBuffer",
+  "Description": "A nice and fancy town",
+  "BackgroundFile": "examples/prerendered-z/scene.jsm",
+  "BackgroundTextureFile": "examples/prerendered-z/scene.png",
+  "ForegroundMapFile": "examples/prerendered-z/scene-front.bsm",
+  "WalkmeshFile": "examples/prerendered-z/scene.jwm",
+  "Camera": {
+    "Matrix": [-0.38940849900245667, 0.0, 0.31637516617774963, 0.0, 0.05515754967927933, 0.4940452575683594, 0.06789033859968185, 0.0, -0.3115299344062805, 0.0874725952744484, -0.38344478607177734, 0.0, -1.6969642639160156, -4.429647445678711, -2.1522560119628906, 1.0],
+    "Fovy": 39,
+    "Near": 0.1,
+    "Far": 10,
+    "MinClipOffsetX": -1.06,
+    "MinClipOffsetY": -0.16,
+    "MaxClipOffsetX": 1.06,
+    "MaxClipOffsetY": 0.16
+  },
+  "Controller": {
+    "JAMFile": "examples/prerendered-z/barret.jam",
+    "TextureFile": "examples/prerendered-z/barret.png",
+    "Radius": 0.02,
+    "Height": 1
+  },
+  "Spawn": {
+    "Name": "Spawn0000",
+    "PositionX": -0.17481517791748047,
+    "PositionY": -4.842235565185547,
+    "PositionZ": -1.1995716094970703,
+    "DirectionX": 1,
+    "DirectionZ": 0
+  }
+}

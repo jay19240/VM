@@ -1,0 +1,116 @@
+{
+    "Ident": "MAT",
+    "Flipbooks": [],
+    "CustomParams": [
+        {
+            "Name": "S00",
+            "Value": 0.0
+        },
+        {
+            "Name": "S01",
+            "Value": 0.0
+        },
+        {
+            "Name": "S02",
+            "Value": 0.0
+        },
+        {
+            "Name": "S03",
+            "Value": 0.0
+        },
+        {
+            "Name": "S04",
+            "Value": 0.0
+        },
+        {
+            "Name": "S05",
+            "Value": 0.0
+        },
+        {
+            "Name": "S06",
+            "Value": 0.0
+        },
+        {
+            "Name": "S07",
+            "Value": 0.0
+        },
+        {
+            "Name": "S08",
+            "Value": 0.0
+        },
+        {
+            "Name": "S09",
+            "Value": 0.0
+        },
+        {
+            "Name": "S10",
+            "Value": 0.0
+        },
+        {
+            "Name": "S11",
+            "Value": 0.0
+        },
+        {
+            "Name": "S12",
+            "Value": 0.0
+        },
+        {
+            "Name": "S13",
+            "Value": 0.0
+        },
+        {
+            "Name": "S14",
+            "Value": 0.0
+        },
+        {
+            "Name": "S15",
+            "Value": 0.0
+        }
+    ],
+    "Id": 0,
+    "NormalMapIntensity": 1.0,
+    "LightEnabled": false,
+    "AmbientR": 0.5,
+    "AmbientG": 0.5,
+    "AmbientB": 0.5,
+    "DiffuseR": 1.0,
+    "DiffuseG": 1.0,
+    "DiffuseB": 1.0,
+    "SpecularR": 0.0,
+    "SpecularG": 0.0,
+    "SpecularB": 0.0,
+    "SpecularFactor": 0.0,
+    "EmissiveR": 0.0,
+    "EmissiveG": 0.0,
+    "EmissiveB": 0.0,
+    "EmissiveFactor": 1.0,
+    "BlendColorR": 1.0,
+    "BlendColorG": 1.0,
+    "BlendColorB": 1.0,
+    "BlendColorMode": 0.0,
+    "Opacity": 0.7,
+    "Texture": "./examples/viewer/bloom/default_noise.jpg",
+    "TextureScrollAngle": 0.0,
+    "TextureScrollRate": 100,
+    "DisplacementMap": "",
+    "DisplacementMapScrollAngle": 0.0,
+    "DisplacementMapScrollRate": 0.0,
+    "DisplacementMapFactor": 0.0,
+    "ToonLightDir": [
+        0.0,
+        0.0,
+        0.0
+    ],
+    "DiffuseMap": "",
+    "SpecularMap": "",
+    "EmissiveMap": "",
+    "NormalMap": "",
+    "EnvMap": "",
+    "ToonMap": "",
+    "DecalEnabled": false,
+    "ShadowEnabled": false,
+    "ToonMapOpacity": 1.0,
+    "AlphaBlendFacing": 0.8999999761581421,
+    "S0Texture": "",
+    "S1Texture": ""
+}

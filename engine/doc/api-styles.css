@@ -1,0 +1,209 @@
+body {
+    position: relative;
+}
+
+pre {
+    margin-top: 0;
+}
+
+pre code {
+    font-family: Courier New;
+    font-size: 12px;
+    width: auto !important;
+    border: 1px solid;
+    border-color: #0008ac;
+    width: 758px;
+    height: auto;
+}
+
+/* ****** */
+/* Utils  */
+/* ****** */
+[onclick] {
+    cursor: pointer!important;
+}
+
+/* ****** */
+/* Module */
+/* ****** */
+.module {
+    display: block;
+    padding: 10px;
+    padding-top:0;
+    margin-top: 15px;
+}
+
+.module-title {
+    background-color: #EEEEEE;
+    border-top: 1px solid #0008ac;
+    border-right: 1px solid #0008ac;
+    border-left: 1px solid #0008ac;
+    text-align: center;
+    white-space: pre-line;
+    font-size: 14px;
+    padding:10px;
+    margin:0;
+}
+
+.module-content {
+    display: block;
+    padding: .5em;
+    color: #000;
+    background: #f8f8ff;
+    letter-spacing: 1px;
+    line-height: 2;
+    border: 1px solid #0008ac;
+}
+
+.module-f {
+    position: relative;
+    display: block;
+    font-size: 14px;
+}
+
+.module-class {
+    display: inline-block;
+    margin-left: 5px;
+    margin-right: 5px;
+}
+
+.module-t {
+    display: inline-block;
+    margin-right: 5px;
+}
+
+.hljs-comment,
+.hljs-template_comment,
+.diff .hljs-header,
+.hljs-javadoc {
+    color: #408080;
+    font-style: italic;
+}
+
+.hljs-keyword,
+.assignment,
+.hljs-literal,
+.css .rule .hljs-keyword,
+.hljs-winutils,
+.javascript .hljs-title,
+.lisp .hljs-title,
+.hljs-subst {
+    color: #954121;
+}
+
+.builtin,
+.constructor,
+.hljs-built_in,
+.lisp .hljs-title {
+    color: #0086b3;
+}
+
+/* ****** */
+/* Schema */
+/* ****** */
+.schema {
+    padding: 10px;
+    padding-bottom:0px;
+}
+
+.schema-table {
+    border: #0008ac 1px solid;
+    border-collapse: collapse;
+    font-size: 14px;
+    vertical-align: middle;
+}
+
+.schema-table th {
+    border: #0008ac 1px solid;
+    height: 26px;
+    text-align: center;
+    font-weight: normal;
+    padding: 4px;
+    cursor:default;
+}
+
+.schema-table td {
+    border: #0008ac 1px solid;
+    height: 26px;
+    text-align: left;
+}
+
+.schema-table-mod {
+    text-align: left;
+    margin-bottom: 2px;
+    margin-top: 2px;
+}
+
+/* ****** */
+/* Colors */
+/* ****** */
+.bgColor0 {
+    background-color: inactivecaption;
+}
+
+.bgColor1 {
+    background-color: lavender;
+}
+
+.bgColor2 {
+    background-color: lightcyan;
+}
+
+.bgColor3 {
+    background-color: #E7F1FF;
+}
+
+.bgColor4 {
+    background-color: #FAFAFA;
+}
+
+.bgColor5 {
+    background-color: #06c;
+}
+
+.bgColor6 {
+    background-color: rgb(233 112 255);
+}
+
+/* ******* */
+/* ToolTip */
+/* ******* */
+[role="tooltip"] {
+    visibility: hidden;
+    position: absolute;
+    top: 2rem;
+    left: 2rem;
+    background: black;
+    color: white;
+    padding: 0.5rem;
+    border-radius: 0.25rem;
+    /* Give some time before hiding so mouse can exit the input
+  and enter the tooltip */
+    transition: visibility 0.5s;
+    z-index:10;
+    white-space: pre-line;
+    line-height:1;
+}
+
+[aria-describedby]:hover,
+[aria-describedby]:focus {
+    position: relative;
+}
+
+[aria-describedby]:hover+[role="tooltip"],
+[aria-describedby]:focus+[role="tooltip"],
+[role="tooltip"]:hover,
+[role="tooltip"]:focus {
+    visibility: visible;
+}
+
+.js-classes {
+    font-size:12px;
+}
+
+.js-class-name {
+    display: block;
+    padding: 5px;
+    background-color: blue;
+    color: white;
+}
