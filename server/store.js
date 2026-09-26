@@ -87,6 +87,9 @@ class Store {
   constructor(filename) {
     this.db = new DatabaseSync(filename);
     this.depth = 0;
+    this.dirty = false;
+    this.listeners = new Set();
+    this.notification = null;
     this.db.exec(`PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;
       PRAGMA synchronous = FULL;
       CREATE TABLE IF NOT EXISTS users (
@@ -142,9 +145,34 @@ class Store {
   }
   get(sql, ...args) { return this.db.prepare(sql).get(...args); }
   all(sql, ...args) { return this.db.prepare(sql).all(...args); }
-  run(sql, ...args) { return this.db.prepare(sql).run(...args); }
+  run(sql, ...args) {
+    const result = this.db.prepare(sql).run(...args);
+    if (result.changes) {
+      if (this.depth) this.dirty = true;
+      else this.notifyChange();
+    }
+    return result;
+  }
+  // Notifications contain no SQL, arguments or private records. Observers read
+  // their own authorized views only AFTER the outer transaction commits.
+  subscribe(listener) {
+    if (typeof listener !== 'function') throw new TypeError('Invalid store observer');
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+  notifyChange() {
+    if (!this.listeners.size || this.notification) return;
+    this.notification = setImmediate(() => {
+      this.notification = null;
+      for (const listener of this.listeners) {
+        try { listener(); } catch { /* Observation must never affect persisted accounting. */ }
+      }
+    });
+    this.notification.unref();
+  }
   transaction(fn) {
     const level = this.depth;
+    const previousDirty = this.dirty;
     const name = `tx_${level}`;
     this.db.exec(level ? `SAVEPOINT ${name}` : 'BEGIN IMMEDIATE');
     this.depth++;
@@ -152,9 +180,11 @@ class Store {
       const result = fn();
       if (result?.then) throw new Error('Transactions must be synchronous');
       this.db.exec(level ? `RELEASE ${name}` : 'COMMIT');
+      if (!level && this.dirty) { this.dirty = false; this.notifyChange(); }
       return result;
     } catch (error) {
       this.db.exec(level ? `ROLLBACK TO ${name}; RELEASE ${name}` : 'ROLLBACK');
+      this.dirty = previousDirty;
       throw error;
     } finally { this.depth--; }
   }
@@ -285,6 +315,6 @@ class Store {
       entries: this.all(`SELECT id,kind,amount,reserved_delta AS reservedDelta,description,created_at AS createdAt
         FROM ledger WHERE user_id = ? ORDER BY rowid DESC LIMIT 100`, userId) };
   }
-  close() { this.db.close(); }
+  close() { clearImmediate(this.notification); this.notification = null; this.listeners.clear(); this.db.close(); }
 }
 module.exports = { Store, userView, projectView, jobView, timestamp };
