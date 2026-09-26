@@ -2,7 +2,9 @@
 const $ = id => document.getElementById(id);
 const state = { session: null, projects: [], selected: null, jobs: [], registering: false,
   pendingRequest: null, purchaseRequests: new Map(), budgetUserId: null, expandedPlans: new Set(),
-  timer: null, view: 'projects', epoch: 0, polling: false, busy: false };
+  view: 'projects', epoch: 0, revision: 0, selection: 0, busy: false,
+  stream: null, streamVersion: 0, reconnectTimer: null, heartbeatTimer: null, reconnectAttempt: 0, pageActive: true,
+  logoutPending: null };
 const format = new Intl.NumberFormat('fr-FR');
 const date = value => new Date(value).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' });
 const statuses = { queued: 'En attente', running: 'Création en cours', succeeded: 'Appliquée', failed: 'Non facturée' };
@@ -37,37 +39,61 @@ function notify(message, error = false) {
   $('notice').className = error ? 'notice error' : 'notice';
   $('notice').hidden = !message;
 }
+// A snapshot supersedes every older REST read. Selection also distinguishes A → B → A.
+const readTicket = () => ({ epoch: state.epoch, revision: state.revision, selection: state.selection });
+const isCurrent = (ticket, snapshot = true) => ticket.epoch === state.epoch && ticket.selection === state.selection &&
+  (!snapshot || ticket.revision === state.revision);
+const connectionStatus = el('span', 'hint');
+connectionStatus.setAttribute('role', 'status');
+connectionStatus.setAttribute('aria-live', 'polite');
+$('account').append(connectionStatus);
 async function api(url, options = {}) {
-  const headers = new Headers(options.headers);
-  if (options.body && !(options.body instanceof FormData)) {
+  const ticket = readTicket();
+  const { timeoutMs = 30000, ...request } = options;
+  const mutation = !['GET', 'HEAD'].includes((request.method || 'GET').toUpperCase());
+  const headers = new Headers(request.headers);
+  if (request.body && !(request.body instanceof FormData)) {
     headers.set('Content-Type', 'application/json');
-    options.body = JSON.stringify(options.body);
+    request.body = JSON.stringify(request.body);
   }
-  if (options.method && options.method !== 'GET' && state.session?.csrfToken) headers.set('X-CSRF-Token', state.session.csrfToken);
-  let response;
-  try { response = await fetch(url, { ...options, headers, credentials: 'same-origin' }); }
-  catch { const error = new Error('Connexion interrompue. Vérifie ton réseau puis réessaie.'); error.uncertain = true; throw error; }
-  if (response.status === 204) return null;
-  let data;
-  try { data = await response.json(); } catch {
-    const error = new Error('Réponse du serveur indisponible. Réessaie dans un instant.'); error.uncertain = true; throw error;
-  }
-  if (!response.ok) {
-    if (response.status === 401 && state.session?.user) {
-      state.session = null; state.epoch++; clearTimeout(state.timer); renderSession();
-    }
-    const error = new Error(data.error || 'La demande a échoué.');
-    error.status = response.status;
-    // A server/proxy error may happen after acceptance. Reuse the operation id on retry.
-    error.uncertain = response.status >= 500;
-    throw error;
-  }
-  return data;
+  if (mutation && state.session?.csrfToken) headers.set('X-CSRF-Token', state.session.csrfToken);
+  const controller = new AbortController();
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error('Délai de réponse dépassé. Réessaie dans un instant.');
+      error.uncertain = mutation;
+      reject(error); controller.abort();
+    }, Math.min(120000, Math.max(1000, timeoutMs)));
+  });
+  try {
+    return await Promise.race([deadline, (async () => {
+      let response;
+      try { response = await fetch(url, { ...request, headers, credentials: 'same-origin', signal: controller.signal }); }
+      catch { const error = new Error('Connexion interrompue. Vérifie ton réseau puis réessaie.'); error.uncertain = mutation; throw error; }
+      // Even a fetch implementation that completes after abort must not affect a later account.
+      if (response.status === 401 && !controller.signal.aborted && isCurrent(ticket) && state.session?.user) clearAuth();
+      if (response.status === 204) return null;
+      let data;
+      try { data = await response.json(); } catch {
+        const error = new Error('Réponse du serveur indisponible. Réessaie dans un instant.'); error.uncertain = mutation; throw error;
+      }
+      if (!response.ok) {
+        const error = new Error(data.error || 'La demande a échoué.');
+        error.status = response.status;
+        // A server/proxy error may happen after acceptance. Reuse the operation id on retry.
+        error.uncertain = response.status >= 500;
+        throw error;
+      }
+      return data;
+    })()]);
+  } finally { clearTimeout(timer); }
 }
 async function action(button, fn) {
+  const epoch = state.epoch;
   const old = button.disabled;
   button.disabled = true;
-  try { await fn(); } catch (error) { notify(error.message, true); }
+  try { await fn(); } catch (error) { if (epoch === state.epoch) notify(error.message, true); }
   finally { button.disabled = old; updateGenerate(); }
 }
 function renderSession() {
@@ -132,20 +158,20 @@ function renderProjects() {
   }
 }
 async function loadProjects() {
-  const epoch = state.epoch;
+  const ticket = readTicket();
   const data = await api('/api/projects');
-  if (epoch !== state.epoch) return;
+  if (!isCurrent(ticket)) return;
   state.projects = data.projects; renderProjects();
 }
 async function selectProject(id) {
-  state.selected = id; state.jobs = []; state.pendingRequest = null; state.expandedPlans.clear();
+  state.selection++; state.selected = id; state.jobs = []; state.busy = false; state.pendingRequest = null; state.expandedPlans.clear();
   $('prompt').value = ''; $('workbench').hidden = false;
   $('selected-project').textContent = state.projects.find(p => p.id === id)?.name || '';
   $('job-list').replaceChildren(el('p', 'hint', 'Chargement…'));
   $('asset-list').replaceChildren(el('p', 'hint', 'Chargement…'));
   renderProjects(); updateGenerate();
+  startEvents();
   await Promise.all([loadJobs(id), loadAssets(id)]);
-  schedulePoll();
 }
 function renderJobs() {
   $('job-list').replaceChildren();
@@ -185,16 +211,17 @@ function renderJobs() {
 }
 async function loadJobs(id = state.selected) {
   if (!id) return;
-  const epoch = state.epoch;
+  const ticket = readTicket();
   const data = await api(`/api/projects/${id}/generations`);
-  if (state.selected !== id || epoch !== state.epoch) return;
+  if (state.selected !== id || !isCurrent(ticket)) return;
   state.jobs = data.jobs; renderJobs();
 }
 async function loadAssets(id = state.selected) {
   if (!id) return;
-  const epoch = state.epoch;
+  const ticket = readTicket();
   const data = await api(`/api/projects/${id}/assets`);
-  if (state.selected !== id || epoch !== state.epoch) return;
+  // Assets are not in snapshots, but still belong to this account and selection.
+  if (state.selected !== id || !isCurrent(ticket, false)) return;
   $('asset-list').replaceChildren();
   if (!data.files.length) $('asset-list').append(el('p', 'hint', 'Aucun asset ajouté pour le moment.'));
   for (const file of data.files) {
@@ -208,23 +235,102 @@ async function loadAssets(id = state.selected) {
   }
 }
 async function refreshSession() {
-  const epoch = state.epoch;
+  const ticket = readTicket();
   const data = await api('/api/session');
-  if (epoch !== state.epoch) return;
+  if (!isCurrent(ticket)) return;
+  const changedAccount = state.session?.user && state.session.user.id !== data.user?.id;
+  if (changedAccount) clearAuth();
   state.session = data; renderSession();
+  if (changedAccount && data.user) await enterStudio();
 }
-function schedulePoll() {
-  clearTimeout(state.timer);
-  if (!state.session?.user || document.hidden) return;
-  state.timer = setTimeout(async () => {
-    if (state.polling) { schedulePoll(); return; }
-    state.polling = true;
+function stopEvents() {
+  state.streamVersion++;
+  clearTimeout(state.reconnectTimer); clearTimeout(state.heartbeatTimer);
+  state.reconnectTimer = null; state.heartbeatTimer = null;
+  state.stream?.close(); state.stream = null;
+}
+function clearAuth() {
+  stopEvents(); state.epoch++; state.selection++; state.revision++;
+  state.session = null; state.projects = []; state.selected = null; state.jobs = []; state.busy = false;
+  state.pendingRequest = null; state.purchaseRequests.clear(); state.expandedPlans.clear(); state.reconnectAttempt = 0;
+  $('workbench').hidden = true; $('prompt').value = ''; $('asset-file').value = ''; connectionStatus.textContent = '';
+  for (const id of ['asset-list', 'ledger', 'plan-list', 'credit-pack-list']) $(id).replaceChildren();
+  for (const id of ['account-name', 'credit-balance', 'credit-reserved', 'wallet-available', 'wallet-reserved', 'subscription-status', 'selected-project']) $(id).textContent = '';
+  renderSession(); renderProjects(); renderJobs();
+}
+const wantsEvents = () => Boolean(state.session?.user && !document.hidden && state.pageActive);
+function reconnectEvents(message) {
+  stopEvents();
+  if (!wantsEvents()) return;
+  connectionStatus.textContent = message;
+  const version = state.streamVersion;
+  const delay = Math.min(30000, 3000 * 2 ** Math.min(state.reconnectAttempt++, 4));
+  state.reconnectTimer = setTimeout(async () => {
+    state.reconnectTimer = null;
+    if (version !== state.streamVersion || !wantsEvents()) return;
     try {
-      await Promise.all([refreshSession(), state.selected ? loadJobs() : Promise.resolve(),
-        state.view === 'billing' ? loadWallet() : Promise.resolve()]);
-    } catch (error) { notify(error.message, true); }
-    finally { state.polling = false; schedulePoll(); }
-  }, state.jobs.some(job => ['queued', 'running'].includes(job.status)) || ['success', 'credits-success'].includes(new URLSearchParams(location.search).get('billing')) ? 3000 : 15000);
+      // Recovery is read-only. Never replay a generation, upload or checkout.
+      await refreshSession();
+      if (version === state.streamVersion && wantsEvents()) startEvents();
+    } catch (error) {
+      if (version === state.streamVersion && wantsEvents()) reconnectEvents(`Connexion indisponible : ${error.message}`);
+    }
+  }, delay);
+}
+function startEvents() {
+  stopEvents();
+  if (!wantsEvents()) return;
+  if (typeof EventSource !== 'function') {
+    connectionStatus.textContent = 'Mises à jour en direct indisponibles : ce navigateur ne prend pas en charge EventSource. Utilise un navigateur compatible.';
+    return;
+  }
+  const version = state.streamVersion;
+  const epoch = state.epoch;
+  const userId = state.session.user.id;
+  const projectId = state.selected;
+  let source;
+  try { source = new EventSource('/api/events' + (projectId === null ? '' : `?projectId=${encodeURIComponent(projectId)}`), { withCredentials: true }); }
+  catch { reconnectEvents('Impossible de connecter les mises à jour en direct. Nouvelle tentative…'); return; }
+  state.stream = source;
+  const current = () => version === state.streamVersion && epoch === state.epoch && state.stream === source && wantsEvents();
+  const heartbeat = () => {
+    clearTimeout(state.heartbeatTimer);
+    state.heartbeatTimer = setTimeout(() => {
+      if (current()) reconnectEvents('Connexion sans réponse. Reconnexion…');
+    }, 45000);
+  };
+  connectionStatus.textContent = 'Connexion aux mises à jour en direct…'; heartbeat();
+  source.addEventListener('open', () => { if (current()) { connectionStatus.textContent = 'Synchronisation en cours…'; heartbeat(); } });
+  source.addEventListener('ping', () => { if (current()) heartbeat(); });
+  source.addEventListener('snapshot', event => {
+    if (!current()) return;
+    let data;
+    try {
+      data = JSON.parse(event.data);
+      if (!data?.user || typeof data.user.id !== 'string' || !Array.isArray(data.projects) || !Array.isArray(data.jobs) ||
+          !data.wallet || !Array.isArray(data.wallet.entries) || !data.storage || typeof data.generationEnabled !== 'boolean' ||
+          [...data.projects, ...data.jobs, ...data.wallet.entries].some(item => !item || typeof item !== 'object')) throw new Error('snapshot');
+    } catch { reconnectEvents('Mise à jour du serveur invalide. Reconnexion…'); return; }
+    if (data.user.id !== userId) { clearAuth(); notify('Le compte connecté a changé. Reconnecte-toi.', true); return; }
+    if (data.projectId !== projectId) return;
+    state.revision++;
+    // Settings and CSRF are deliberately absent from the protocol; keep the /api/session values.
+    state.session = { ...state.session, user: data.user, storage: data.storage, generationEnabled: data.generationEnabled };
+    state.projects = data.projects; state.jobs = data.jobs;
+    renderSession(); renderProjects(); renderJobs(); renderWallet(data.wallet);
+    $('selected-project').textContent = state.projects.find(project => project.id === state.selected)?.name || '';
+    state.reconnectAttempt = 0; connectionStatus.textContent = 'Mises à jour en direct connectées'; heartbeat();
+  });
+  source.addEventListener('session-expired', () => {
+    if (current()) { clearAuth(); notify('Ta session a expiré. Reconnecte-toi.', true); }
+  });
+  source.addEventListener('server-shutdown', () => { if (current()) reconnectEvents('Serveur en redémarrage. Reconnexion…'); });
+  source.addEventListener('error', () => {
+    if (!current()) return;
+    if (source.readyState === EventSource.CLOSED) reconnectEvents('Connexion fermée. Vérification de la session…');
+    else connectionStatus.textContent = 'Connexion interrompue. Reconnexion automatique…';
+    // CONNECTING uses native EventSource retry:3000; the watchdog bounds silent stalls.
+  });
 }
 function showView(view) {
   state.view = view;
@@ -234,9 +340,12 @@ function showView(view) {
   if (view === 'billing') loadBilling().catch(error => notify(error.message, true));
 }
 async function loadWallet() {
-  const epoch = state.epoch;
+  const ticket = readTicket();
   const wallet = await api('/api/wallet');
-  if (epoch !== state.epoch) return;
+  if (!isCurrent(ticket)) return;
+  renderWallet(wallet);
+}
+function renderWallet(wallet) {
   $('wallet-available').textContent = format.format(wallet.available);
   $('wallet-reserved').textContent = format.format(wallet.reserved);
   $('ledger').replaceChildren();
@@ -325,27 +434,45 @@ $('login-tab').addEventListener('click', () => setAuthMode(false));
 $('register-tab').addEventListener('click', () => setAuthMode(true));
 $('auth-form').addEventListener('submit', async event => {
   event.preventDefault(); $('auth-submit').disabled = true; $('auth-error').textContent = '';
+  clearAuth(); const epoch = state.epoch;
   try {
-    state.session = await api('/api/auth/' + (state.registering ? 'register' : 'login'), { method: 'POST',
+    // Serialize cookie-changing requests: a late logout Set-Cookie must not
+    // clear the cookie issued by a newer login/register response.
+    await state.logoutPending;
+    if (epoch !== state.epoch) return;
+    const session = await api('/api/auth/' + (state.registering ? 'register' : 'login'), { method: 'POST',
       body: { name: $('name').value, email: $('email').value, password: $('password').value } });
-    state.epoch++; $('password').value = ''; notify(''); renderSession(); await enterStudio();
-  } catch (error) { $('auth-error').textContent = error.message; }
+    if (epoch !== state.epoch) return;
+    state.session = session; $('password').value = ''; notify(''); renderSession(); await enterStudio();
+  } catch (error) { if (epoch === state.epoch) $('auth-error').textContent = error.message; }
   finally { $('auth-submit').disabled = false; }
 });
 $('logout').addEventListener('click', () => action($('logout'), async () => {
-  await api('/api/auth/logout', { method: 'POST' });
-  state.epoch++; clearTimeout(state.timer); state.session = null; state.selected = null; state.jobs = [];
-  state.pendingRequest = null; state.purchaseRequests.clear(); state.expandedPlans.clear(); $('workbench').hidden = true; $('prompt').value = ''; notify(''); renderSession();
+  if (state.logoutPending) return;
+  const logout = api('/api/auth/logout', { method: 'POST' });
+  const barrier = logout.then(() => {}, () => {});
+  state.logoutPending = barrier;
+  // Close immediately, even if the logout response is slow or lost. A new login
+  // waits for this bounded request to finish or abort before sending credentials.
+  clearAuth(); notify('');
+  const epoch = state.epoch;
+  try { await logout; }
+  catch (error) { if (epoch === state.epoch) notify(`Déconnexion serveur non confirmée : ${error.message}`, true); }
+  finally { if (state.logoutPending === barrier) state.logoutPending = null; }
 }));
 $('new-project').addEventListener('click', () => { $('create-form').hidden = false; $('project-name').focus(); });
 $('cancel-create').addEventListener('click', () => { $('create-form').hidden = true; });
 $('create-form').addEventListener('submit', event => {
   event.preventDefault();
   action(event.submitter, async () => {
+    const ticket = readTicket();
     notify('Préparation du projet : copie du moteur et des assets…');
-    const { project } = await api('/api/projects', { method: 'POST', body: { name: $('project-name').value } });
-    $('create-form').reset(); $('create-form').hidden = true; await Promise.all([loadProjects(), refreshSession()]); await selectProject(project.id);
-    notify('Ton nouveau projet est prêt. À toi de jouer.');
+    const { project } = await api('/api/projects', { method: 'POST', timeoutMs: 120000, body: { name: $('project-name').value } });
+    if (!isCurrent(ticket, false)) return;
+    $('create-form').reset(); $('create-form').hidden = true; await Promise.all([loadProjects(), refreshSession()]);
+    if (!isCurrent(ticket, false)) return;
+    await selectProject(project.id);
+    if (ticket.epoch === state.epoch && state.selected === project.id) notify('Ton nouveau projet est prêt. À toi de jouer.');
   });
 });
 $('generation-budget').addEventListener('input', updateGenerate);
@@ -358,40 +485,62 @@ $('prompt-form').addEventListener('submit', async event => {
   if (!state.pendingRequest || state.pendingRequest.project !== project || state.pendingRequest.prompt !== prompt || state.pendingRequest.budgetCredits !== budgetCredits) {
     state.pendingRequest = { project, prompt, budgetCredits, requestId: crypto.randomUUID() };
   }
+  const ticket = readTicket();
   state.busy = true; updateGenerate();
   try {
     await api(`/api/projects/${project}/generations`, { method: 'POST', body: { prompt, budgetCredits, requestId: state.pendingRequest.requestId } });
-    state.pendingRequest = null; if (project === state.selected) $('prompt').value = '';
+    if (!isCurrent(ticket, false)) return;
+    state.pendingRequest = null; $('prompt').value = '';
     notify('Demande reçue. Ton plafond est réservé ; seul l’usage OpenAI réel, arrondi au crédit supérieur, sera débité après publication réussie. Le reste sera libéré. Échec ou aucun changement : aucun débit.');
     await Promise.all([loadJobs(project), refreshSession()]);
   } catch (error) {
+    if (!isCurrent(ticket, false)) return;
     if (!error.uncertain) state.pendingRequest = null;
     notify(error.message + (error.uncertain ? ' Une nouvelle tentative réutilisera la même demande pour éviter un double débit.' : ''), true);
-  } finally { state.busy = false; updateGenerate(); schedulePoll(); }
+  } finally { if (isCurrent(ticket, false)) { state.busy = false; updateGenerate(); } }
 });
 $('upload-form').addEventListener('submit', event => {
   event.preventDefault(); const project = state.selected; if (!project) return;
   action(event.submitter, async () => {
+    const ticket = readTicket();
     const data = new FormData(); data.append('folder', $('asset-folder').value.trim()); data.append('file', $('asset-file').files[0]);
-    await api(`/api/projects/${project}/assets`, { method: 'POST', body: data });
-    if (project === state.selected) $('asset-file').value = '';
-    await Promise.all([loadAssets(project), refreshSession()]); notify('Asset ajouté à ton projet.');
+    await api(`/api/projects/${project}/assets`, { method: 'POST', timeoutMs: 120000, body: data });
+    if (!isCurrent(ticket, false)) return;
+    $('asset-file').value = '';
+    await Promise.all([loadAssets(project), refreshSession()]);
+    if (isCurrent(ticket, false)) notify('Asset ajouté à ton projet.');
   });
 });
 $('projects-tab').addEventListener('click', () => showView('projects'));
 $('billing-tab').addEventListener('click', () => showView('billing'));
 $('recharge').addEventListener('click', () => showView('billing'));
-$('manage-subscription').addEventListener('click', () => action($('manage-subscription'), async () => lemonRedirect((await api('/api/billing/portal', { method: 'POST' })).url)));
-document.addEventListener('visibilitychange', () => { clearTimeout(state.timer); if (!document.hidden) schedulePoll(); });
-window.addEventListener('pagehide', () => clearTimeout(state.timer));
+$('manage-subscription').addEventListener('click', () => action($('manage-subscription'), async () => {
+  const epoch = state.epoch;
+  const result = await api('/api/billing/portal', { method: 'POST' });
+  if (epoch === state.epoch) lemonRedirect(result.url);
+}));
+function suspendEvents() {
+  // Do not discard the very first session response while bootstrap is pending;
+  // without it a returning page cannot decide whether to reopen a stream.
+  if (state.session) state.revision++;
+  stopEvents();
+}
+document.addEventListener('visibilitychange', () => { if (document.hidden) suspendEvents(); else startEvents(); });
+window.addEventListener('pagehide', () => { state.pageActive = false; suspendEvents(); });
+window.addEventListener('pageshow', () => { state.pageActive = true; startEvents(); });
 async function enterStudio() {
-  state.selected = null; state.jobs = []; state.purchaseRequests.clear(); state.expandedPlans.clear(); $('workbench').hidden = true;
+  state.selection++; state.selected = null; state.jobs = []; state.purchaseRequests.clear(); state.expandedPlans.clear(); $('workbench').hidden = true;
+  const ticket = readTicket();
+  startEvents();
   await loadProjects();
+  if (!isCurrent(ticket, false)) return;
   const returned = new URLSearchParams(location.search).get('billing');
   showView(returned ? 'billing' : 'projects');
   if (['success', 'credits-success'].includes(returned)) notify('Retour de Lemon Squeezy : les crédits apparaîtront après confirmation du paiement. Aucun crédit n’est ajouté à partir de cette page.');
   if (['cancelled', 'credits-cancelled'].includes(returned)) notify('Paiement interrompu. Le solde reste basé uniquement sur les confirmations Lemon Squeezy.');
-  schedulePoll();
 }
-(async () => { try { await refreshSession(); if (state.session?.user) await enterStudio(); }
-  catch (error) { $('loading').hidden = true; notify(error.message, true); } })();
+(async () => {
+  const epoch = state.epoch;
+  try { await refreshSession(); if (epoch === state.epoch && state.session?.user) await enterStudio(); }
+  catch (error) { if (epoch === state.epoch) { $('loading').hidden = true; notify(error.message, true); } }
+})();

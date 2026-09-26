@@ -23,23 +23,58 @@ class Node {
   addEventListener(name, handler) { this.events.set(name, handler); }
   focus() {} reset() {}
 }
+const flush = () => new Promise(resolve => setImmediate(resolve));
+const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
+const response = (data, status = 200) => ({ status, ok: status < 400, async json() { return structuredClone(data); } });
 async function fixture({ packs = [], plans = [], subscription = null, purchaseReplies = [], checkoutReplies = [],
-  portalReplies = [], generationReplies = [], projects = [], jobs = [], sessionOverrides = {}, search = '' } = {}) {
+  portalReplies = [], generationReplies = [], projects = [], jobs = [], sessionOverrides = {}, search = '', eventSourceAvailable = true,
+  bootstrapResponse = null } = {}) {
   const nodes = new Map([...html.matchAll(/id="([^"]+)"/g)].map(m => [m[1], new Node()]));
-  const calls = [];
+  const calls = []; const streams = []; const timers = new Map(); const routes = new Map();
+  const documentEvents = new Map(); const windowEvents = new Map();
+  let now = 0; let nextTimer = 0;
+  const setTimer = (fn, delay) => { const id = ++nextTimer; timers.set(id, { fn, at: now + delay, delay }); return id; };
+  async function advance(ms) {
+    const target = now + ms;
+    for (;;) {
+      const next = [...timers].filter(([, timer]) => timer.at <= target).sort((a, b) => a[1].at - b[1].at)[0];
+      if (!next) break;
+      const [id, timer] = next; now = timer.at; timers.delete(id); timer.fn(); await flush();
+    }
+    now = target; await flush();
+  }
+  class MockEventSource {
+    static CONNECTING = 0; static OPEN = 1; static CLOSED = 2;
+    constructor(url, options) { this.url = url; this.options = options; this.readyState = 0; this.events = new Map(); this.closed = false; streams.push(this); }
+    addEventListener(name, handler) { this.events.set(name, handler); }
+    close() { this.closed = true; this.readyState = 2; }
+    // Deliberately allow queued events after close to exercise stale-stream guards.
+    emit(name, data = {}) {
+      if (name === 'open') this.readyState = 1;
+      this.events.get(name)?.({ data: typeof data === 'string' ? data : JSON.stringify(data), lastEventId: 'opaque-not-a-revision' });
+    }
+    error(closed = false) { this.readyState = closed ? 2 : 0; this.emit('error'); }
+  }
   const session = { user: { id: randomUUID(), name: '<img src=x onerror=alert(1)>', email: 'fixture@example.test', credits: 20, reservedCredits: 3 },
     csrfToken: randomBytes(32).toString('hex'), generationMaxCredits: 200, generationEnabled: true, billingEnabled: true,
     billingProvider: 'lemon-squeezy', aiModel: 'gpt-6-astra', microUsdPerCredit: 10000,
     storage: { usedBytes: 1024 ** 2, limitBytes: 1024 ** 3, maxProjects: 10 }, ...sessionOverrides };
   let authenticated = false;
   const context = vm.createContext({
-    console, Headers, FormData, Blob, URL, URLSearchParams, Intl, Date, crypto: { randomUUID },
-    setTimeout: () => 1, clearTimeout() {},
+    console, Headers, FormData, Blob, URL, URLSearchParams, Intl, Date, AbortController, crypto: { randomUUID },
+    EventSource: eventSourceAvailable ? MockEventSource : undefined,
+    setTimeout: setTimer, clearTimeout: id => timers.delete(id),
     location: { search, assign(url) { calls.push({ redirect: url }); } },
-    window: { addEventListener() {} },
-    document: { hidden: false, getElementById: id => nodes.get(id), createElement: tag => new Node(tag), addEventListener() {} },
+    window: { addEventListener: (name, handler) => windowEvents.set(name, handler) },
+    document: { hidden: false, getElementById: id => nodes.get(id), createElement: tag => new Node(tag),
+      addEventListener: (name, handler) => documentEvents.set(name, handler) },
     async fetch(url, options) {
       calls.push({ url, options });
+      if (url === '/api/session' && bootstrapResponse) {
+        const pending = bootstrapResponse; bootstrapResponse = null; return pending;
+      }
+      const route = routes.get(`${options.method || 'GET'} ${url}`);
+      if (route) return route(options);
       let data;
       if (url === '/api/auth/login') { authenticated = true; data = session; }
       else if (url === '/api/session') data = authenticated ? session : { ...session, user: null, csrfToken: null };
@@ -60,12 +95,20 @@ async function fixture({ packs = [], plans = [], subscription = null, purchaseRe
       else throw new Error('Unhandled mocked API route');
       if (data === 'network-error') throw new Error('Test network failure');
       const status = data.httpStatus || 200;
-      return { ok: status < 400, status, async json() { return data.body || data; } };
+      return response(data.body || data, status);
     },
   });
   vm.runInContext(script, context, { filename: 'web/app.js' });
-  await new Promise(resolve => setImmediate(resolve));
-  return { nodes, calls, context, session };
+  await flush();
+  const snapshot = (overrides = {}) => ({ user: structuredClone(session.user), storage: structuredClone(session.storage),
+    generationEnabled: session.generationEnabled, projects: structuredClone(projects),
+    projectId: vm.runInContext('state.selected', context), jobs: structuredClone(jobs),
+    wallet: { balance: session.user.credits, reserved: session.user.reservedCredits,
+      available: session.user.credits - session.user.reservedCredits, entries: [] }, ...overrides });
+  return { nodes, calls, context, session, streams, timers, routes, advance, snapshot,
+    connection: nodes.get('account').children.at(-1),
+    hide(hidden) { context.document.hidden = hidden; documentEvents.get('visibilitychange')(); },
+    page(name) { windowEvents.get(name)(); } };
 }
 const packOffer = { id: 'boost', name: 'Boost', amount: 500, currency: 'eur', credits: 50 };
 const planOffer = { id: 'studio', name: 'Studio', amount: 1200, currency: 'eur', credits: 100,
@@ -355,7 +398,7 @@ test('public plans are collapsed native details and render markup, links and lin
   }
 });
 
-test('polling preserves plan expansion through phase changes and switching projects resets it', async () => {
+test('explicit job refresh preserves plan expansion through phase changes and switching projects resets it', async () => {
   const jobs = [{ id: 'job-1', status: 'running', phase: 'coding', plan: 'Plan public', cost: 8,
     prompt: 'Une idée', createdAt: projectFixture.createdAt }];
   const h = await generationFixture({ jobs });
@@ -479,4 +522,389 @@ test('billing return query parameters never grant credits or create checkouts', 
     assert.equal(h.nodes.get('wallet-available').textContent, '17');
     assert.equal(h.calls.filter(call => call.options?.method === 'POST' && call.url.startsWith('/api/billing/')).length, 0);
   }
+});
+
+const posts = h => h.calls.filter(call => call.options?.method === 'POST');
+const stateValue = (h, expression) => vm.runInContext(expression, h.context);
+
+test('one authenticated same-origin SSE stream replaces jobs, plans, quotas and wallet, preserving session settings', async () => {
+  const h = await fixture({ projects: [projectFixture] });
+  assert.equal(h.streams.length, 0, 'guests must not open an authenticated stream');
+  await login(h);
+  const initial = h.streams[0];
+  assert.equal(initial.url, '/api/events'); assert.equal(initial.options.withCredentials, true);
+  await h.context.selectProject(projectFixture.id);
+  const source = h.streams.at(-1);
+  assert.equal(initial.closed, true);
+  assert.equal(source.url, '/api/events?projectId=project-1');
+  const job = { id: 'job-live', status: 'running', phase: 'coding', plan: '<script>Plan public</script>',
+    prompt: 'Une idée', cost: 8, createdAt: projectFixture.createdAt };
+  setBudget(h, 6);
+  source.emit('snapshot', h.snapshot({ jobs: [job], user: { ...h.session.user, credits: 80, reservedCredits: 8 },
+    storage: { usedBytes: 2048, limitBytes: 4096, maxProjects: 1 },
+    wallet: { balance: 80, reserved: 8, available: 72, entries: [{ amount: 60, description: 'Crédits reçus', createdAt: projectFixture.createdAt }] } }));
+  assert.match(h.nodes.get('job-list').textContent, /Écriture du jeu.*<script>Plan public<\/script>/);
+  assert.equal(h.nodes.get('credit-balance').textContent, '72');
+  assert.equal(h.nodes.get('wallet-available').textContent, '72');
+  assert.equal(h.nodes.get('wallet-reserved').textContent, '8');
+  assert.match(h.nodes.get('ledger').textContent, /Crédits reçus.*\+60/);
+  assert.match(h.nodes.get('storage-summary').textContent, /2 Kio \/ 4 Kio/);
+  assert.equal(h.nodes.get('new-project').disabled, true);
+  const details = h.nodes.get('job-list').children[0].children.find(node => node.tagName === 'DETAILS');
+  details.open = true; details.events.get('toggle')();
+  source.emit('snapshot', h.snapshot({ jobs: [{ ...job, status: 'succeeded', chargedCredits: 2 }],
+    projects: [{ ...projectFixture, name: 'Nom actualisé' }], generationEnabled: false }));
+  assert.match(h.nodes.get('job-list').textContent, /Appliquée.*2 crédit\(s\) débité/);
+  assert.equal(h.nodes.get('job-list').children[0].children.find(node => node.tagName === 'DETAILS').open, true);
+  assert.equal(h.nodes.get('selected-project').textContent, 'Nom actualisé');
+  assert.equal(h.nodes.get('generation-disabled').hidden, false);
+  assert.equal(h.nodes.get('generate').disabled, true);
+  assert.equal(h.nodes.get('generation-budget').value, '6');
+  assert.equal(stateValue(h, 'state.session.csrfToken'), h.session.csrfToken);
+  assert.equal(stateValue(h, 'state.session.billingEnabled'), true);
+  assert.equal(stateValue(h, 'state.session.generationMaxCredits'), 200);
+  assert.equal(stateValue(h, 'state.session.aiModel'), h.session.aiModel);
+  source.emit('snapshot', h.snapshot({ projects: [], jobs: [] }));
+  assert.equal(stateValue(h, 'state.projects.length'), 0);
+  assert.equal(stateValue(h, 'state.jobs.length'), 0);
+  assert.match(h.nodes.get('ledger').textContent, /Aucune opération/);
+  assert.equal(h.nodes.get('generate').disabled, true);
+});
+
+test('project changes encode the selected id and reject old streams, wrong-project events and A → B → A REST replies', async () => {
+  const other = { ...projectFixture, id: 'project ?&', name: 'Autre jeu' };
+  const h = await generationFixture({ projects: [projectFixture, other] });
+  const old = h.streams.at(-1);
+  const delayed = deferred();
+  h.routes.set('GET /api/projects/project-1/generations', () => delayed.promise);
+  const read = h.context.loadJobs();
+  await h.context.selectProject(other.id);
+  assert.equal(h.streams.at(-1).url, '/api/events?projectId=project%20%3F%26');
+  old.emit('snapshot', h.snapshot({ projectId: projectFixture.id, user: { ...h.session.user, credits: 999 } }));
+  old.emit('session-expired');
+  assert.equal(h.nodes.get('credit-balance').textContent, '17');
+  const current = h.streams.at(-1);
+  current.emit('snapshot', h.snapshot({ projectId: projectFixture.id, jobs: [{ status: 'failed' }] }));
+  assert.equal(stateValue(h, 'state.jobs.length'), 0);
+  h.routes.delete('GET /api/projects/project-1/generations');
+  await h.context.selectProject(projectFixture.id);
+  delayed.resolve(response({ jobs: [{ status: 'failed', prompt: 'obsolete' }] })); await read;
+  assert.doesNotMatch(h.nodes.get('job-list').textContent, /obsolete/);
+  assert.equal(old.closed, true); assert.equal(current.closed, true);
+  assert.equal(h.streams.filter(stream => !stream.closed).length, 1);
+});
+
+test('a newer snapshot supersedes delayed session, project, job and wallet REST bodies', async () => {
+  const h = await generationFixture();
+  const values = [
+    ['/api/session', { ...h.session, user: { ...h.session.user, credits: 1 } }, () => h.context.refreshSession()],
+    ['/api/projects', { projects: [] }, () => h.context.loadProjects()],
+    ['/api/projects/project-1/generations', { jobs: [{ status: 'failed', prompt: 'obsolete' }] }, () => h.context.loadJobs()],
+    ['/api/wallet', { balance: 1, reserved: 0, available: 1, entries: [] }, () => h.context.loadWallet()],
+  ];
+  const reads = values.map(([url, , load]) => {
+    const body = deferred(); h.routes.set(`GET ${url}`, () => ({ status: 200, ok: true, json: () => body.promise }));
+    return { body, pending: load() };
+  });
+  await flush();
+  h.streams.at(-1).emit('snapshot', h.snapshot({ user: { ...h.session.user, credits: 90, reservedCredits: 0 },
+    wallet: { balance: 90, reserved: 0, available: 90, entries: [] },
+    jobs: [{ id: 'latest', status: 'succeeded', prompt: 'latest', cost: 2, createdAt: projectFixture.createdAt }] }));
+  reads.forEach(({ body }, index) => body.resolve(values[index][1]));
+  await Promise.all(reads.map(read => read.pending));
+  assert.equal(h.nodes.get('credit-balance').textContent, '90');
+  assert.equal(h.nodes.get('wallet-available').textContent, '90');
+  assert.equal(stateValue(h, 'state.projects.length'), 1);
+  assert.match(h.nodes.get('job-list').textContent, /latest/);
+  assert.doesNotMatch(h.nodes.get('job-list').textContent, /obsolete/);
+});
+
+test('old-account events, reads and unauthorized replies cannot replace or sign out a newer account', async () => {
+  const h = await generationFixture();
+  const old = h.streams.at(-1); const oldSnapshot = h.snapshot();
+  const delayedSession = deferred(); const delayedUnauthorized = deferred();
+  h.routes.set('GET /api/session', () => delayedSession.promise);
+  h.routes.set('GET /api/wallet', () => delayedUnauthorized.promise);
+  const read = h.context.refreshSession();
+  const unauthorized = assert.rejects(h.context.loadWallet(), error => error.status === 401);
+  await h.nodes.get('logout').events.get('click')();
+  h.session.user = { ...h.session.user, id: randomUUID(), name: 'Autre compte', credits: 60, reservedCredits: 0 };
+  await login(h);
+  old.emit('snapshot', oldSnapshot); old.emit('session-expired'); old.emit('server-shutdown'); old.error(true);
+  delayedSession.resolve(response({ ...h.session, user: oldSnapshot.user }));
+  delayedUnauthorized.resolve(response({ error: 'Ancienne session' }, 401));
+  await Promise.all([read, unauthorized]);
+  assert.equal(h.nodes.get('account-name').textContent, 'Autre compte');
+  assert.equal(h.nodes.get('credit-balance').textContent, '60');
+  assert.equal(h.nodes.get('auth-view').hidden, true);
+  assert.equal(h.streams.at(-1).closed, false);
+});
+
+test('transient errors use native reconnect; open, ping and repeated full snapshots never poll or POST', async () => {
+  const h = await generationFixture(); const source = h.streams.at(-1);
+  const requests = h.calls.length; const count = h.streams.length;
+  h.context.notify('Erreur de paiement à conserver', true);
+  source.emit('snapshot', h.snapshot()); source.error();
+  assert.match(h.connection.textContent, /Reconnexion automatique/);
+  source.emit('open'); source.emit('snapshot', h.snapshot());
+  for (let i = 0; i < 8; i++) { await h.advance(15000); source.emit('ping'); }
+  assert.equal(h.calls.length, requests); assert.equal(h.streams.length, count);
+  assert.equal(h.nodes.get('notice').textContent, 'Erreur de paiement à conserver');
+  assert.match(h.connection.textContent, /connectées/);
+  assert.doesNotMatch(script, /schedulePoll|state\.polling|setInterval/);
+});
+
+test('CLOSED streams recheck the normal session with bounded exponential backoff and reset after a snapshot', async () => {
+  const h = await generationFixture(); const mutations = posts(h).length;
+  let sessionReads = h.calls.filter(call => call.url === '/api/session').length;
+  for (const delay of [3000, 6000, 12000, 24000, 30000, 30000]) {
+    const source = h.streams.at(-1); source.error(true);
+    assert.equal(source.closed, true);
+    await h.advance(delay - 1);
+    assert.equal(h.calls.filter(call => call.url === '/api/session').length, sessionReads);
+    await h.advance(1);
+    assert.equal(h.calls.filter(call => call.url === '/api/session').length, ++sessionReads);
+    assert.notEqual(h.streams.at(-1), source);
+  }
+  h.streams.at(-1).emit('snapshot', h.snapshot());
+  const source = h.streams.at(-1); source.emit('server-shutdown');
+  await h.advance(3000);
+  assert.notEqual(h.streams.at(-1), source);
+  assert.equal(posts(h).length, mutations);
+  assert.equal(h.streams.filter(stream => !stream.closed).length, 1);
+});
+
+test('CLOSED recovery logs out on 401 or a guest session; network failures remain bounded and read-only', async () => {
+  for (const unauthorized of [true, false]) {
+    const h = await generationFixture(); const count = h.streams.length;
+    h.routes.set('GET /api/session', () => response(unauthorized ? { error: 'Session expirée' } : { ...h.session, user: null }, unauthorized ? 401 : 200));
+    h.streams.at(-1).error(true); await h.advance(3000);
+    assert.equal(h.nodes.get('auth-view').hidden, false);
+    assert.equal(h.streams.length, count); assert.equal(h.timers.size, 0);
+  }
+  const h = await generationFixture(); const count = h.streams.length; const mutations = posts(h).length;
+  h.routes.set('GET /api/session', () => { throw new Error('offline'); });
+  h.streams.at(-1).error(true); await h.advance(3000);
+  assert.match(h.connection.textContent, /Connexion indisponible/);
+  await h.advance(5999); assert.equal(h.streams.length, count);
+  h.routes.delete('GET /api/session'); await h.advance(1);
+  assert.equal(h.streams.length, count + 1); assert.equal(posts(h).length, mutations);
+});
+
+test('heartbeat watchdog restarts a stalled stream around 45 seconds after its last heartbeat', async () => {
+  const h = await generationFixture(); const source = h.streams.at(-1);
+  source.emit('snapshot', h.snapshot());
+  await h.advance(44000); source.emit('ping');
+  await h.advance(44000); assert.equal(source.closed, false);
+  await h.advance(1000); assert.equal(source.closed, true);
+  assert.match(h.connection.textContent, /sans réponse/);
+  const mutations = posts(h).length;
+  await h.advance(3000);
+  assert.notEqual(h.streams.at(-1), source); assert.equal(posts(h).length, mutations);
+});
+
+test('hidden and pagehide close streams and timers; visible/pageshow resume exactly one selected-project stream', async () => {
+  const h = await generationFixture(); const source = h.streams.at(-1);
+  const calls = h.calls.length;
+  h.hide(true); assert.equal(source.closed, true); assert.equal(h.timers.size, 0);
+  source.emit('session-expired'); source.error(true);
+  await h.advance(120000); assert.equal(h.calls.length, calls);
+  h.hide(false); const visible = h.streams.at(-1);
+  assert.notEqual(visible, source); assert.equal(visible.url, '/api/events?projectId=project-1');
+  h.page('pagehide'); assert.equal(visible.closed, true); assert.equal(h.timers.size, 0);
+  h.hide(false); assert.equal(h.streams.at(-1), visible, 'visibility alone cannot undo pagehide');
+  h.page('pageshow'); assert.equal(h.streams.filter(stream => !stream.closed).length, 1);
+  assert.equal(h.streams.at(-1).url, visible.url);
+  h.hide(true); h.page('pageshow'); assert.equal(h.streams.filter(stream => !stream.closed).length, 0);
+});
+
+test('suspension invalidates a pending session recheck without opening another stream on return', async () => {
+  const h = await generationFixture(); const delayed = deferred();
+  h.routes.set('GET /api/session', () => delayed.promise);
+  h.streams.at(-1).error(true); await h.advance(3000);
+  h.hide(true); h.hide(false);
+  const source = h.streams.at(-1); const count = h.streams.length;
+  source.emit('snapshot', h.snapshot({ user: { ...h.session.user, credits: 40 } }));
+  delayed.resolve(response({ ...h.session, user: null })); await flush();
+  assert.equal(h.streams.length, count); assert.equal(source.closed, false);
+  assert.equal(h.nodes.get('credit-balance').textContent, '37');
+});
+
+test('session-expired clears private state and timers and never revives on visibility changes', async () => {
+  const h = await generationFixture(); const source = h.streams.at(-1);
+  source.emit('snapshot', h.snapshot()); source.emit('session-expired');
+  assert.equal(source.closed, true); assert.equal(h.timers.size, 0);
+  assert.equal(h.nodes.get('auth-view').hidden, false);
+  assert.equal(stateValue(h, 'state.projects.length + state.jobs.length + state.purchaseRequests.size'), 0);
+  assert.equal(stateValue(h, 'state.pendingRequest'), null);
+  assert.equal(h.nodes.get('prompt').value, ''); assert.equal(h.nodes.get('workbench').hidden, true);
+  assert.equal(h.nodes.get('ledger').children.length, 0);
+  const count = h.streams.length; const calls = h.calls.length;
+  h.hide(true); h.hide(false); h.page('pageshow'); await h.advance(120000);
+  assert.equal(h.streams.length, count); assert.equal(h.calls.length, calls);
+});
+
+test('logout closes immediately but serializes new login until the old cookie-deleting headers arrive', async () => {
+  const h = await generationFixture(); const old = h.streams.at(-1); const delayed = deferred();
+  const headers = []; let browserCookie = 'old';
+  h.routes.set('POST /api/auth/logout', async () => {
+    await delayed.promise;
+    // Model the browser applying Set-Cookie before fetch delivers the Response.
+    browserCookie = null; headers.push('logout'); return response(null, 204);
+  });
+  h.routes.set('POST /api/auth/login', () => {
+    browserCookie = 'new'; headers.push('login'); return response(h.session);
+  });
+  const attempts = h.calls.filter(call => call.url === '/api/auth/login').length;
+  const logout = h.nodes.get('logout').events.get('click')();
+  assert.equal(old.closed, true); assert.equal(h.nodes.get('auth-view').hidden, false);
+  const pendingLogin = login(h); await flush();
+  assert.equal(h.calls.filter(call => call.url === '/api/auth/login').length, attempts);
+  assert.equal(h.nodes.get('auth-submit').disabled, true);
+  delayed.resolve(); await Promise.all([logout, pendingLogin]);
+  old.emit('session-expired');
+  assert.deepEqual(headers, ['logout', 'login']); assert.equal(browserCookie, 'new');
+  assert.equal(h.nodes.get('auth-view').hidden, true); assert.equal(h.streams.at(-1).closed, false);
+});
+
+test('timed-out logout is aborted before a waiting login can issue a new session cookie', async () => {
+  const h = await generationFixture(); const delayed = deferred(); const headers = [];
+  let logoutSignal;
+  h.routes.set('POST /api/auth/logout', async options => {
+    logoutSignal = options.signal;
+    await delayed.promise;
+    if (!options.signal.aborted) headers.push('logout');
+    return response(null, 204);
+  });
+  h.routes.set('POST /api/auth/login', () => {
+    assert.equal(logoutSignal.aborted, true);
+    headers.push('login'); return response(h.session);
+  });
+  const logout = h.nodes.get('logout').events.get('click')();
+  const pendingLogin = login(h); await flush();
+  await h.advance(29999); assert.deepEqual(headers, []);
+  await h.advance(1); await Promise.all([logout, pendingLogin]);
+  delayed.resolve(); await flush();
+  assert.deepEqual(headers, ['login']);
+  assert.equal(h.nodes.get('auth-view').hidden, true);
+  assert.equal(stateValue(h, 'state.logoutPending'), null);
+});
+
+test('hiding during initial session loading does not discard bootstrap or leave the page stuck', async () => {
+  for (const authenticated of [false, true]) {
+    for (const finishHidden of [false, true]) {
+      const delayed = deferred();
+      const h = await fixture({ bootstrapResponse: delayed.promise, projects: [projectFixture] });
+      h.hide(true); h.page('pagehide');
+      if (!finishHidden) { h.page('pageshow'); h.hide(false); }
+      delayed.resolve(response(authenticated ? h.session : { ...h.session, user: null, csrfToken: null }));
+      await flush();
+      if (finishHidden) { h.page('pageshow'); h.hide(false); }
+      await flush();
+      assert.equal(h.nodes.get('loading').hidden, true);
+      assert.equal(h.nodes.get('auth-view').hidden, authenticated);
+      assert.equal(h.nodes.get('studio-view').hidden, !authenticated);
+      assert.equal(h.streams.filter(stream => !stream.closed).length, authenticated ? 1 : 0);
+      assert.equal(h.calls.filter(call => call.url === '/api/session').length, 1);
+    }
+  }
+});
+
+for (const stage of ['fetch', 'body']) test(`generation ${stage} timeout aborts after 30s, remains uncertain and preserves the request ID for manual retry`, async () => {
+  const h = await generationFixture(); const delayed = deferred(); const route = 'POST /api/projects/project-1/generations';
+  h.routes.set(route, () => stage === 'fetch' ? delayed.promise : { status: 200, ok: true, json: () => delayed.promise });
+  setBudget(h, 6);
+  const pending = submitPrompt(h); await flush();
+  const first = generationPosts(h)[0];
+  await h.advance(29999); assert.equal(first.options.signal.aborted, false);
+  await h.advance(1); await pending;
+  assert.equal(first.options.signal.aborted, true);
+  assert.match(h.nodes.get('notice').textContent, /Délai.*même demande/);
+  assert.equal(stateValue(h, 'state.busy'), false);
+  assert.equal(generationPosts(h).length, 1);
+  // Reconnection, including a shutdown after an uncertain mutation, is read-only.
+  h.streams.at(-1).emit('server-shutdown'); await h.advance(3000);
+  assert.equal(generationPosts(h).length, 1);
+  h.routes.delete(route); await submitPrompt(h);
+  assert.equal(generationPosts(h).length, 2);
+  assert.equal(JSON.parse(first.options.body).requestId, JSON.parse(generationPosts(h)[1].options.body).requestId);
+  delayed.resolve(stage === 'fetch' ? response({}) : {}); await flush();
+  assert.equal(generationPosts(h).length, 2);
+});
+
+test('REST timeouts cover read bodies and longer mutation limits are bounded, with timers cleaned on all paths', async () => {
+  const h = await fixture();
+  h.routes.set('GET /slow-read', () => ({ status: 200, ok: true, json: () => new Promise(() => {}) }));
+  const read = assert.rejects(h.context.api('/slow-read'), error => /Délai/.test(error.message) && error.uncertain === false);
+  await h.advance(30000); await read;
+  assert.equal(h.calls.at(-1).options.signal.aborted, true); assert.equal(h.timers.size, 0);
+  h.routes.set('POST /slow-write', () => new Promise(() => {}));
+  const write = assert.rejects(h.context.api('/slow-write', { method: 'POST', timeoutMs: 999999 }), error => error.uncertain === true);
+  await h.advance(119999); assert.equal(h.calls.at(-1).options.signal.aborted, false);
+  await h.advance(1); await write;
+  assert.equal(h.calls.at(-1).options.signal.aborted, true); assert.equal(h.timers.size, 0);
+  await h.context.refreshSession(); assert.equal(h.timers.size, 0);
+});
+
+test('malformed SSE and unavailable EventSource report explicit errors without replacing unrelated notices or polling', async () => {
+  const h = await generationFixture(); const source = h.streams.at(-1);
+  h.context.notify('Erreur indépendante', true); source.emit('snapshot', '{not-json');
+  assert.equal(source.closed, true); assert.match(h.connection.textContent, /invalide/);
+  assert.equal(h.nodes.get('notice').textContent, 'Erreur indépendante');
+  await h.advance(3000);
+  h.streams.at(-1).emit('snapshot', h.snapshot({ wallet: null }));
+  assert.match(h.connection.textContent, /invalide/);
+  assert.equal(h.nodes.get('credit-balance').textContent, '17');
+  const unsupported = await fixture({ eventSourceAvailable: false }); await login(unsupported);
+  assert.match(unsupported.connection.textContent, /ne prend pas en charge EventSource/);
+  assert.equal(unsupported.streams.length, 0); assert.equal(unsupported.timers.size, 0);
+  const calls = unsupported.calls.length; await unsupported.advance(120000);
+  assert.equal(unsupported.calls.length, calls);
+});
+
+test('a delayed 401 from before a newer snapshot cannot clear the current authenticated state', async () => {
+  const h = await generationFixture(); const delayed = deferred();
+  h.routes.set('GET /api/wallet', () => delayed.promise);
+  const read = assert.rejects(h.context.loadWallet(), error => error.status === 401);
+  h.streams.at(-1).emit('snapshot', h.snapshot({ user: { ...h.session.user, credits: 50 } }));
+  delayed.resolve(response({ error: 'Obsolete' }, 401)); await read;
+  assert.equal(h.nodes.get('auth-view').hidden, true);
+  assert.equal(h.nodes.get('credit-balance').textContent, '47');
+  assert.equal(h.streams.at(-1).closed, false);
+});
+
+test('a delayed generation reply after project switching cannot clear the new prompt or trigger extra refreshes', async () => {
+  const other = { ...projectFixture, id: 'project-2' };
+  const h = await generationFixture({ projects: [projectFixture, other] }); const delayed = deferred();
+  h.routes.set('POST /api/projects/project-1/generations', () => delayed.promise);
+  const pending = submitPrompt(h);
+  await h.context.selectProject(other.id);
+  h.nodes.get('prompt').value = 'Nouvelle idée';
+  const calls = h.calls.length;
+  delayed.resolve(response({})); await pending;
+  assert.equal(h.nodes.get('prompt').value, 'Nouvelle idée');
+  assert.equal(stateValue(h, 'state.selected'), other.id);
+  assert.equal(h.calls.length, calls); assert.equal(generationPosts(h).length, 1);
+});
+
+test('invalid REST bodies and rejected mutations remain visible without leaving timeout timers behind', async () => {
+  const h = await generationFixture();
+  h.routes.set('POST /api/projects/project-1/generations', () => ({ status: 200, ok: true, json() { throw new Error('invalid JSON'); } }));
+  await submitPrompt(h);
+  assert.match(h.nodes.get('notice').textContent, /Réponse du serveur indisponible.*même demande/);
+  const firstId = JSON.parse(generationPosts(h)[0].options.body).requestId;
+  h.routes.set('POST /api/projects/project-1/generations', () => response({ error: 'Budget refusé' }, 400));
+  await submitPrompt(h);
+  assert.equal(JSON.parse(generationPosts(h)[1].options.body).requestId, firstId);
+  assert.match(h.nodes.get('notice').textContent, /Budget refusé/);
+  assert.equal(stateValue(h, 'state.pendingRequest'), null);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 30000).length, 0);
+});
+
+test('current-stream account mismatch fails closed instead of mixing accounts or CSRF settings', async () => {
+  const h = await generationFixture(); const source = h.streams.at(-1);
+  source.emit('snapshot', h.snapshot({ user: { ...h.session.user, id: randomUUID() } }));
+  assert.equal(source.closed, true); assert.equal(h.nodes.get('auth-view').hidden, false);
+  assert.equal(stateValue(h, 'state.session'), null); assert.equal(h.timers.size, 0);
+  assert.match(h.nodes.get('notice').textContent, /compte connecté a changé/);
 });

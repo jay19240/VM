@@ -7,6 +7,7 @@ const { createAuth } = require('./auth');
 const { createBilling } = require('./billing');
 const { createProjects, UUID } = require('./files');
 const { createJobs } = require('./jobs');
+const { createEvents } = require('./events');
 const { createAgentRunner } = require('./runner');
 const { createPricing } = require('./ai-pricing');
 const { acquireLock } = require('./lock');
@@ -35,6 +36,7 @@ async function createApplication({ config = loadConfig(), runner, lemonClient } 
   const unlock = acquireLock(config.dataDir);
   let store;
   let jobs;
+  let events;
   try {
     store = new Store(config.databasePath);
     const billing = createBilling({ config, store, lemonClient });
@@ -44,6 +46,7 @@ async function createApplication({ config = loadConfig(), runner, lemonClient } 
     await jobs.recover();
     const projects = createProjects({ store, config, entitlements: userId => billing.getEntitlements(userId) });
     const auth = createAuth({ store, config });
+    events = createEvents({ store });
     const app = express();
     let accepting = true;
     app.use((_req, _res, next) => { if (!accepting) throw new HttpError(503, 'Le serveur est en cours d’arrêt.'); next(); });
@@ -92,6 +95,33 @@ async function createApplication({ config = loadConfig(), runner, lemonClient } 
     app.use('/api', auth.requireUser);
     app.use('/api', (req, res, next) => ['GET', 'HEAD', 'OPTIONS'].includes(req.method) ? next() : auth.requireCsrf(req, res, next));
     app.post('/api/auth/logout', auth.logout);
+    app.get('/api/events', (req, res) => {
+      // Cookie authentication is sufficient for a read-only same-origin stream.
+      // Explicitly reject cross-origin/site resource consumption too (not only CORS reads).
+      if ((req.get('origin') && req.get('origin') !== config.appUrl) ||
+          (req.get('sec-fetch-site') && !['same-origin', 'none'].includes(req.get('sec-fetch-site')))) {
+        throw new HttpError(403, 'Origine du flux non autorisée.');
+      }
+      const projectId = req.query.projectId ?? null;
+      if (Object.keys(req.query).some(key => key !== 'projectId') ||
+          (projectId !== null && (typeof projectId !== 'string' || !UUID.test(projectId)))) {
+        throw new HttpError(400, 'Projet de suivi invalide.');
+      }
+      if (projectId !== null) store.ownProject(req.session.user_id, projectId);
+      events.open(req, res, () => {
+        const userId = req.session.user_id;
+        if (projectId !== null) store.ownProject(userId, projectId);
+        return {
+          user: userView(store.get('SELECT * FROM users WHERE id = ?', userId)),
+          storage: projects.storage(userId), generationEnabled: Boolean(runner.enabled && jobs.available),
+          projects: store.all('SELECT * FROM projects WHERE user_id = ? ORDER BY created_at DESC', userId).map(projectView),
+          projectId,
+          jobs: projectId === null ? [] : store.all(
+            'SELECT * FROM jobs WHERE project_id = ? AND user_id = ? ORDER BY rowid DESC LIMIT 100', projectId, userId).map(jobView),
+          wallet: store.wallet(userId),
+        };
+      });
+    });
     app.get('/api/projects', (req, res) => res.json({ projects: store.all('SELECT * FROM projects WHERE user_id = ? ORDER BY created_at DESC', req.session.user_id).map(projectView) }));
     app.post('/api/projects', rateLimit(10, 3600000, req => req.session.user_id), jsonOnly, async (req, res) => {
       res.status(201).json({ project: projectView(await projects.create(req.session.user_id, req.body?.name)) });
@@ -161,8 +191,8 @@ async function createApplication({ config = loadConfig(), runner, lemonClient } 
     });
     let closed = false;
     return { app, store, config, jobs,
-      beginShutdown() { accepting = false; jobs.pause(); },
-      async close() { if (closed) return; closed = true; accepting = false; await jobs.close(); store.close(); unlock(); } };
-  } catch (error) { if (jobs) await jobs.close(); store?.close(); unlock(); throw error; }
+      beginShutdown() { accepting = false; jobs.pause(); events.close(); },
+      async close() { if (closed) return; closed = true; accepting = false; events.close(); await jobs.close(); store.close(); unlock(); } };
+  } catch (error) { events?.close(); if (jobs) await jobs.close(); store?.close(); unlock(); throw error; }
 }
 module.exports = { createApplication, rateLimit };
