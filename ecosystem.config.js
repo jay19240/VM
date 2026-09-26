@@ -3,6 +3,10 @@ module.exports = {
     {
       name: "api-backend",
       script: "./server.js",
+      node_args: "--env-file-if-exists=.env",
+      instances: 1,
+      exec_mode: "fork",
+      kill_timeout: 90000,
       env: {
         PORT: 3000
       }
