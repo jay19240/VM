@@ -1,139 +1,136 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
-// -----------------------------------------------------------------------------------
-const { HttpError } = require('./errors');
-const { timestamp } = require('./store');
-const { UUID } = require('./constants');
-const { CHECK_PATH, FILE_EXISTS } = require('./utils');
-// -----------------------------------------------------------------------------------
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const httpError = status => Object.assign(new Error('Projet indisponible.'), { status });
 
-
-function projectRoot(config, userId, projectId) {
-  if (!UUID.test(userId) || !UUID.test(projectId)) throw new HttpError(404, 'Projet introuvable.');
-  return path.join(config.dataDir, 'users', userId, projectId);
+// Filesystem safety only: no syntax, TypeScript, build or gameplay checks.
+async function checkFiles(root) {
+  let files = 0;
+  let bytes = 0;
+  async function visit(directory, depth = 0) {
+    const stat = await fs.lstat(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || depth > 12) throw new Error('Invalid directory');
+    for (const name of await fs.readdir(directory)) {
+      if (name.startsWith('.')) throw new Error('Hidden game file');
+      const filename = path.join(directory, name);
+      const info = await fs.lstat(filename);
+      if (info.isSymbolicLink()) throw new Error('Symlink refused');
+      if (info.isDirectory()) { await visit(filename, depth + 1); continue; }
+      if (!info.isFile() || info.nlink !== 1 || ++files > 200 || info.size > 2 * 1024 ** 2 ||
+          (bytes += info.size) > 10 * 1024 ** 2) throw new Error('Invalid game file');
+    }
+  }
+  await visit(root);
+  if (!(await fs.lstat(path.join(root, 'main.js'))).isFile()) throw new Error('Missing main.js');
 }
 
-async function COPY_ENGINE(source, destination) {
-  // The template is never written. Exclude dependencies/builds and private tool/auth configuration.
-  await fs.cp(source, destination, { recursive: true, force: false, errorOnExist: true,
-    filter: async filename => {
-      const relative = path.relative(source, filename);
-      if (relative.split(path.sep).some(part => ['node_modules', 'dist', 'target', 'coverage'].includes(part) ||
-          (part.startsWith('.') && part !== '.gitignore' && part !== '.augmentignore'))) return false;
-      const stat = await fs.lstat(filename);
-      if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) throw new HttpError(500, 'Le modèle du moteur contient un fichier non autorisé.');
-      return true;
-    } });
-}
-
-function createProjects({ store, config, entitlements = () => null }) {
-  const queues = new Map();
-  async function exclusive(id, fn) {
-    const previous = queues.get(id) || Promise.resolve();
-    const result = previous.then(fn);
-    const tail = result.catch(() => {});
-    queues.set(id, tail);
-    try { return await result; } finally { if (queues.get(id) === tail) queues.delete(id); }
+function createProjects({ config, runner }) {
+  const directory = path.join(config.dataDir, 'projects');
+  let active = null;
+  let stopped = false;
+  let cleanupError = null;
+  function root(id) {
+    if (typeof id !== 'string' || !UUID.test(id)) throw httpError(404);
+    return path.join(directory, id);
   }
-  function storage(userId) {
-    const plan = entitlements(userId);
-    return { usedBytes: store.get(`SELECT coalesce(sum(a.size),0) AS n FROM assets a
-      JOIN projects p ON p.id=a.project_id WHERE p.user_id=?`, userId).n,
-      limitBytes: plan?.assetQuotaBytes ?? config.maxUserAssetBytes,
-      maxProjects: plan?.maxProjects ?? config.maxProjects };
-  }
-
-  function assertOwnProject(userId, id) {
-    const row = store.get('SELECT * FROM projects WHERE id = ? AND user_id = ?', id, userId);
-    if (!row) throw new HttpError(404, 'Projet introuvable.');
-    return row;
-  }
-
-  function getByUserID(userId) {
-    return store.all('SELECT * FROM projects WHERE user_id = ? ORDER BY created_at DESC', userId);
-  }
-
-  async function create(userId, name) {
-    if (typeof name !== 'string' || !name.trim() || name.trim().length > 80) throw new HttpError(400, 'Le nom du projet doit contenir de 1 à 80 caractères.');
-    const id = randomUUID();
-    store.transaction(() => {
-      const count = store.get("SELECT count(*) AS n FROM projects WHERE user_id = ? AND status != 'failed'", userId).n;
-      if (count >= storage(userId).maxProjects) throw new HttpError(409, 'Nombre maximum de projets atteint pour ton offre.');
-      store.run('INSERT INTO projects VALUES (?,?,?,?,?,?)', id, userId, name.trim(), 'provisioning', timestamp(), timestamp());
-    });
-    const root = projectRoot(config, userId, id);
+  async function get(id) {
     try {
-      await fs.mkdir(root, { recursive: true, mode: 0o700 });
-      await COPY_ENGINE(config.engineDir, path.join(root, 'engine'));
-      await fs.mkdir(path.join(root, 'engine/public/game'), { recursive: true, mode: 0o755 });
-      const game = await fs.lstat(path.join(root, 'engine/src/game'));
-      if (!game.isDirectory() || game.isSymbolicLink()) throw new Error('Invalid game template');
-      store.run("UPDATE projects SET status = 'ready', updated_at = ? WHERE id = ?", timestamp(), id);
-      return assertOwnProject(userId, id);
-    } catch {
-      store.run("UPDATE projects SET status = 'failed' WHERE id = ?", id);
-      throw new HttpError(500, 'La copie du moteur a échoué. Le projet est conservé pour diagnostic.');
+      const location = root(id);
+      const stat = await fs.lstat(location);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw httpError(404);
+      const project = JSON.parse(await fs.readFile(path.join(location, 'project.json'), 'utf8'));
+      return { id, name: project.name, createdAt: project.createdAt, generating: active?.id === id };
+    } catch (error) {
+      if (error.code === 'ENOENT') throw httpError(404);
+      throw error;
     }
   }
-  function listAssets(projectId) {
-    return store.all('SELECT * FROM assets WHERE project_id = ? ORDER BY created_at DESC', projectId).map(assetView);
-  }
-  function assetView(row) {
-    return { id: row.id, filename: row.filename, folder: row.folder, size: row.size, createdAt: row.created_at,
-      downloadUrl: `/api/projects/${row.project_id}/assets/${row.id}/download` };
-  }
-  async function upload(userId, projectId, file, folder = '') {
-    if (!file || !file.size) throw new HttpError(400, 'Choisis un fichier non vide.');
-    if (typeof folder !== 'string' || typeof file.originalname !== 'string' || file.originalname.includes('/') || file.originalname.includes('\\')) {
-      throw new HttpError(400, 'Nom de fichier ou dossier invalide.');
+  async function list() {
+    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    const projects = [];
+    for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !UUID.test(entry.name)) continue;
+      try { projects.push(await get(entry.name)); }
+      catch (error) { if (error.status !== 404) throw error; } // Ignore unfinished copies.
     }
-    // Serialize uploads across every project of one owner as well as against that project's generation.
-    return exclusive(`assets:${userId}`, () => exclusive(projectId, async () => {
-      const project = assertOwnProject(userId, projectId);
-      if (project.status !== 'ready') throw new HttpError(409, 'Le projet n’est pas prêt.');
-      if (store.get("SELECT id FROM jobs WHERE project_id = ? AND status IN ('queued','running','publishing')", projectId)) throw new HttpError(409, 'Attends la fin de la génération avant de modifier les assets.');
-      const root = path.join(projectRoot(config, userId, projectId), 'engine/public/game');
-      await CHECK_PATH(root, folder, { directory: true, create: true });
-      const relative = folder ? `${folder}/${file.originalname}` : file.originalname;
-      const destination = await CHECK_PATH(root, relative);
-      if (await FILE_EXISTS(destination)) throw new HttpError(409, 'Un fichier porte déjà ce nom. Renomme-le avant l’envoi.');
-      const quota = storage(userId);
-      if (quota.usedBytes + file.size > quota.limitBytes) throw new HttpError(413, 'Quota global d’assets de ton compte atteint.');
-      let handle;
-      try {
-        handle = await fs.open(destination, 'wx', 0o644);
-        await handle.writeFile(file.buffer);
-        await handle.sync();
-      } catch (error) {
-        if (error.code === 'EEXIST') throw new HttpError(409, 'Un fichier porte déjà ce nom. Renomme-le avant l’envoi.');
-        if (handle) { await handle.close(); handle = null; await fs.unlink(destination); }
-        throw error;
-      } finally { await handle?.close(); }
-      const id = randomUUID();
-      try {
-        store.run('INSERT INTO assets VALUES (?,?,?,?,?,?)', id, projectId, file.originalname, folder, file.size, timestamp());
-      } catch (error) {
-        // Remove only the just-created unregistered upload, never existing assets.
-        await fs.unlink(destination);
-        throw error;
-      }
-      return assetView(store.get('SELECT * FROM assets WHERE id = ?', id));
-    }));
+    return projects.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
-
-  async function download(userId, projectId, assetId) {
-    assertOwnProject(userId, projectId);
-    const row = store.get('SELECT * FROM assets WHERE id = ? AND project_id = ?', assetId, projectId);
-    if (!row) throw new HttpError(404, 'Fichier introuvable.');
-    const root = path.join(projectRoot(config, userId, projectId), 'engine/public/game');
-    return { filename: row.filename, path: await CHECK_PATH(root, row.folder ? `${row.folder}/${row.filename}` : row.filename) };
+  async function exclusive(id, action) {
+    if (stopped || cleanupError) throw httpError(503);
+    if (active) throw httpError(409);
+    const controller = new AbortController();
+    const promise = Promise.resolve().then(() => action(controller.signal));
+    active = { id, controller, promise };
+    try { return await promise; }
+    catch (error) {
+      if (error.cleanupFailed) cleanupError = error;
+      throw error;
+    } finally { active = null; }
   }
-
-  return { create, assertOwnProject, getByUserID, listAssets, upload, download, exclusive, storage };
+  async function create(name) {
+    if (typeof name !== 'string' || !name.trim() || name.trim().length > 80) throw httpError(400);
+    const id = randomUUID();
+    await exclusive(id, async signal => {
+      const engine = path.join(root(id), 'engine');
+      await fs.mkdir(root(id), { recursive: true, mode: 0o700 });
+      await fs.cp(config.engineDir, engine, { recursive: true, errorOnExist: true, force: false,
+        filter: async filename => {
+          signal.throwIfAborted();
+          const relative = path.relative(config.engineDir, filename);
+          if (relative.split(path.sep).some(part => part.startsWith('.') ||
+              ['node_modules', 'dist', 'target', 'coverage'].includes(part))) return false;
+          const stat = await fs.lstat(filename);
+          if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) throw new Error('Invalid template');
+          return true;
+        } });
+      await checkFiles(path.join(engine, 'src/game'));
+      signal.throwIfAborted();
+      await fs.writeFile(path.join(root(id), 'project.json'), JSON.stringify({ name: name.trim(), createdAt: new Date().toISOString() }),
+        { flag: 'wx', mode: 0o600 });
+    });
+    return get(id);
+  }
+  async function readCode(id) {
+    await get(id);
+    const game = path.join(root(id), 'engine/src/game');
+    await checkFiles(game);
+    return fs.readFile(path.join(game, 'main.js'), 'utf8');
+  }
+  async function generate(id, prompt) {
+    if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 16000) throw httpError(400);
+    if (!runner.enabled) throw httpError(503);
+    await exclusive(id, async signal => {
+      await get(id);
+      const requestId = randomUUID();
+      const engineDir = path.join(root(id), 'engine');
+      const live = path.join(engineDir, 'src/game');
+      const work = path.join(root(id), 'attempts', requestId);
+      const gameDir = path.join(work, 'game');
+      const previous = path.join(work, 'previous');
+      const timer = setTimeout(() => active.controller.abort(), config.aiderTimeoutMs);
+      try {
+        await checkFiles(live);
+        await fs.mkdir(work, { recursive: true, mode: 0o700 });
+        await fs.cp(live, gameDir, { recursive: true, errorOnExist: true, force: false });
+        signal.throwIfAborted();
+        await runner.run({ id: requestId, engineDir, gameDir, prompt: prompt.trim(), signal });
+        signal.throwIfAborted();
+        await checkFiles(gameDir);
+        signal.throwIfAborted();
+        await fs.rename(live, previous);
+        try { await fs.rename(gameDir, live); }
+        catch (error) { await fs.rename(previous, live); throw error; }
+      } finally { clearTimeout(timer); }
+    });
+    return get(id);
+  }
+  async function close() {
+    stopped = true;
+    active?.controller.abort();
+    await active?.promise.catch(() => {});
+    if (cleanupError) throw cleanupError; // Keep the server lock until Docker is stopped manually.
+  }
+  return { list, get, create, readCode, generate, close, get available() { return !stopped && !cleanupError; } };
 }
-
-
-
-
-module.exports = { createProjects, projectRoot, UUID, CHECK_PATH, COPY_ENGINE, exists: FILE_EXISTS };
+module.exports = { createProjects, UUID };

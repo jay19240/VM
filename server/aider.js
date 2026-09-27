@@ -2,89 +2,52 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
-const { UUID } = require('./constants');
+const { UUID } = require('./files');
 
 // Only trusted commands live here. The user's request is a read-only file, never shell code.
-// A user-owned FIFO avoids reopening Docker's root-owned stderr pipe as non-root.
-// Keep one writer open between events, then drain the reader before returning Aider's exit code.
-const START = `git init -q && git add src && mkfifo -m 600 /tmp/aider-usage || exit 1
-cat /tmp/aider-usage >&2 &
-reader=$!
-exec 3>/tmp/aider-usage
-/venv/bin/aider "$@"
-result=$?
-exec 3>&-
-wait "$reader"
-exit "$result"`;
+const START = 'git init -q && git add src && exec /venv/bin/aider "$@"';
 const failure = () => new Error('Aider indisponible ou génération interrompue.');
 const containerName = id => {
   if (!UUID.test(id)) throw failure();
   return `legacy-aider-${id}`;
 };
 
-// Parse decimal USD without binary float rounding at credit boundaries.
-function microDollars(value) {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) throw failure();
-  const [digits, exponent = '0'] = String(value).toLowerCase().split('e');
-  const [whole, fraction = ''] = digits.split('.');
-  const numerator = BigInt(whole + fraction);
-  const places = fraction.length - Number(exponent) - 6;
-  const amount = places <= 0 ? numerator * 10n ** BigInt(-places) :
-    (numerator + 10n ** BigInt(places) - 1n) / 10n ** BigInt(places);
-  if (amount > BigInt(Number.MAX_SAFE_INTEGER)) throw failure();
-  return Number(amount);
-}
-
 function createAider(config, spawnProcess = spawn) {
   const keyName = config.aiderModel?.startsWith('openai/') ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY';
   const apiKey = keyName === 'OPENAI_API_KEY' ? config.openaiApiKey : config.anthropicApiKey;
   let enabled = false;
-  // Docker client only: do not inherit payment credentials or arbitrary AIDER_* options.
+  // Docker client only: never inherit unrelated credentials or arbitrary AIDER_* options.
   const dockerEnv = Object.fromEntries(['PATH', 'HOME', 'DOCKER_HOST', 'DOCKER_CONTEXT', 'XDG_RUNTIME_DIR']
     .filter(key => process.env[key]).map(key => [key, process.env[key]]));
 
-  function docker(args, { signal, onLine, secret = false, timeout = 30000 } = {}) {
+  function docker(args, { signal, capture = false, secret = false, timeout = 30000 } = {}) {
     return new Promise((resolve, reject) => {
       let child;
       try {
         child = spawnProcess('docker', args, { env: secret ? { ...dockerEnv, [keyName]: apiKey } : dockerEnv,
-          stdio: ['ignore', 'pipe', 'pipe'], shell: false });
+          stdio: ['ignore', capture ? 'pipe' : 'ignore', 'ignore'], shell: false });
       } catch { reject(failure()); return; }
-      let output = ''; let pending = ''; let rejected = false;
-      const stop = () => { rejected = true; child.kill('SIGKILL'); };
+      let output = ''; let interrupted = false;
+      const stop = () => { interrupted = true; child.kill('SIGKILL'); };
       const timer = setTimeout(stop, timeout);
       signal?.addEventListener('abort', stop, { once: true });
       if (signal?.aborted) stop();
-      // Generation stdout contains code/provider messages. Discard it, never log it.
-      child.stdout.on('data', chunk => {
-        if (onLine) return;
+      child.stdout?.on('data', chunk => {
         output += chunk.toString('utf8');
         if (output.length > 4096) stop();
-      });
-      child.stderr.setEncoding('utf8');
-      child.stderr.on('data', chunk => {
-        if (!onLine || rejected) return;
-        pending += chunk;
-        if (pending.length > 65536) { stop(); return; }
-        let newline;
-        while ((newline = pending.indexOf('\n')) >= 0) {
-          const line = pending.slice(0, newline); pending = pending.slice(newline + 1);
-          try { onLine(line); } catch { stop(); break; }
-        }
       });
       const finish = () => { clearTimeout(timer); signal?.removeEventListener('abort', stop); };
       child.on('error', () => { finish(); reject(failure()); });
       child.on('close', code => {
         finish();
-        if (!rejected && onLine && pending.trim()) { try { onLine(pending); } catch { rejected = true; } }
-        if (rejected || code !== 0) reject(failure()); else resolve(output.trim());
+        if (interrupted || code !== 0) reject(failure()); else resolve(output.trim());
       });
     });
   }
 
   async function cleanup(id) {
     const name = containerName(id);
-    const found = await docker(['container', 'ls', '--all', '--quiet', '--filter', `name=^/${name}$`]);
+    const found = await docker(['container', 'ls', '--all', '--quiet', '--filter', `name=^/${name}$`], { capture: true });
     if (found) {
       if (!/^[a-f0-9]{12,64}$/.test(found)) throw failure();
       await docker(['container', 'rm', '--force', name]);
@@ -100,12 +63,11 @@ function createAider(config, spawnProcess = spawn) {
         await docker(['info', '--format', '{{.ServerVersion}}']);
         await docker(['image', 'inspect', '--format', '{{.Id}}', config.aiderImage]);
         enabled = true;
-      } catch { /* Projects stay usable; never reserve credits without Docker and its image. */ }
+      } catch { /* Projects stay usable when generation is unavailable. */ }
     },
     cleanup,
-    async run({ id, engineDir, gameDir, prompt, budgetMicroUsd, signal, onUsage }) {
-      if (!enabled || signal?.aborted || typeof prompt !== 'string' || !prompt.trim() || prompt.length > 16000 ||
-          typeof onUsage !== 'function' || typeof budgetMicroUsd !== 'bigint' || budgetMicroUsd <= 0n) throw failure();
+    async run({ id, engineDir, gameDir, prompt, signal }) {
+      if (!enabled || signal?.aborted || typeof prompt !== 'string' || !prompt.trim() || prompt.length > 16000) throw failure();
       const name = containerName(id);
       const uid = process.getuid?.() || 1000;
       const gid = process.getgid?.() || 1000;
@@ -147,42 +109,23 @@ function createAider(config, spawnProcess = spawn) {
         '--message-file', '/request.txt', '--model', config.aiderModel, '--weak-model', config.aiderModel,
         '--yes-always', '--no-auto-commits', '--no-dirty-commits', '--no-gitignore',
         '--no-auto-lint', '--no-auto-test', '--no-suggest-shell-commands', '--no-detect-urls', '--disable-playwright',
-        '--no-check-update', '--no-show-release-notes', '--no-analytics', '--analytics-log', '/tmp/aider-usage',
+        '--no-check-update', '--no-show-release-notes', '--no-analytics',
         '--no-pretty', '--no-stream', '--no-fancy-input', '--config', '/dev/null', '--env-file', '/dev/null',
         '--input-history-file', '/tmp/input', '--chat-history-file', '/tmp/chat', '--file', 'src/game/main.js');
-      let usage = { costMicroUsd: 0, inputTokens: 0, outputTokens: 0, requests: 0 };
-      let lastTotal = 0;
-      function report(line) {
-        if (!line.startsWith('{')) return; // Never persist diagnostics, keys, model text or analytics metadata.
-        const event = JSON.parse(line);
-        if (event.event === 'message_send_exception') throw failure();
-        if (event.event !== 'message_send') return;
-        const p = event.properties;
-        if (!p || !Number.isSafeInteger(p.prompt_tokens) || p.prompt_tokens < 0 ||
-            !Number.isSafeInteger(p.completion_tokens) || p.completion_tokens < 0 ||
-            !Number.isFinite(p.total_cost) || p.total_cost <= 0 || p.total_cost < lastTotal) throw failure();
-        lastTotal = p.total_cost;
-        usage = { costMicroUsd: microDollars(p.total_cost), inputTokens: usage.inputTokens + p.prompt_tokens,
-          outputTokens: usage.outputTokens + p.completion_tokens, requests: usage.requests + 1 };
-        if (Object.values(usage).some(value => !Number.isSafeInteger(value))) throw failure();
-        const result = onUsage(usage);
-        if (result?.then) { Promise.resolve(result).catch(() => {}); throw failure(); }
-        if (BigInt(usage.costMicroUsd) > budgetMicroUsd) throw failure();
-      }
       try {
         // Create first, then start: even if cancellation kills the attach client, cleanup knows the exact container.
         await docker(args, { secret: true });
         if (signal?.aborted) throw failure();
-        await docker(['start', '--attach', name], { signal, onLine: report, timeout: config.jobTimeoutMs });
-        if (!usage.requests || signal?.aborted) throw failure();
+        await docker(['start', '--attach', name], { signal, timeout: config.aiderTimeoutMs });
+        if (signal?.aborted) throw failure();
       } finally {
         try { await cleanup(id); }
         catch {
           enabled = false;
-          const error = failure(); error.retainReservation = true; throw error;
+          const error = failure(); error.cleanupFailed = true; throw error;
         }
       }
     },
   };
 }
-module.exports = { createAider, microDollars };
+module.exports = { createAider };
