@@ -1,3 +1,7 @@
+const { HttpError } = require('./errors');
+const { COOKIE_TOKEN, DIGEST: digest } = require('./utils');
+const { COOKIE_NAME, SECURE_COOKIE_NAME } = require('./constants');
+
 module.exports.MIDDLEWARE_JSON_ONLY = (req, _res, next) => {
   if (!req.is('application/json')) {
     throw new HttpError(415, 'Un corps JSON est requis.');
@@ -15,28 +19,26 @@ module.exports.MIDDLEWARE_REQUIRE_USER = (req, _res, next) => {
 }
 
 module.exports.MIDDLEWARE_REQUIRE_CSRF = (req, _res, next) => {
-  if (!req.session || req.get('x-csrf-token') !== req.session.csrf) {
+  if (!req.session || typeof req.session.csrf !== 'string' || !req.session.csrf ||
+      req.get('x-csrf-token') !== req.session.csrf) {
     throw new HttpError(403, 'Session expirée ou requête non autorisée. Recharge la page.');
   }
 
   next();
 }
 
-module.exports.MIDDLEWARE_AUTH_LOAD = (req, _res, next) => {
-  const token = module.exports.COOKIE_TOKEN(req);
-  if (!token) {
-    req.session = null;
-    return next();
-  }
-
-  req.session = store.get(`
-    SELECT sessions.*,users.id,users.name,users.email,users.credits,users.reserved
-    FROM sessions JOIN users ON users.id = sessions.user_id
-    WHERE token_hash = ? AND expires_at > ?`, digest(token), Date.now()
-  );
-
-  next();
-}
+module.exports.CREATE_MIDDLEWARE_AUTH_LOAD = ({ store, config }) => {
+  const cookieName = config.secureCookies ? SECURE_COOKIE_NAME : COOKIE_NAME;
+  return (req, _res, next) => {
+    const token = COOKIE_TOKEN(req, cookieName);
+    req.session = token ? store.get(`
+      SELECT sessions.*,users.id,users.name,users.email,users.credits,users.reserved
+      FROM sessions JOIN users ON users.id = sessions.user_id
+      WHERE token_hash = ? AND expires_at > ?`, digest(token), Date.now()
+    ) || null : null;
+    next();
+  };
+};
 
 module.exports.CREATE_MIDDLEWARE_RATE_LIMIT = (max, duration, key = req => req.ip) => {
   const windows = new Map();

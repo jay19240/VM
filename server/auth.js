@@ -1,12 +1,16 @@
 const crypto = require('node:crypto');
 const { HttpError } = require('./errors');
-const { timestamp } = require('./store');
+const { timestamp, userView } = require('./store');
 // -----------------------------------------------------------------------------------
-const { PASSWORD_HASH, VERIFY_PASSWORD, COOKIE_TOKEN, CREDENTIALS } = require('./utils');
-const { COOKIE_NAME } = require('./constants');
+const { PASSWORD_HASH, VERIFY_PASSWORD, COOKIE_TOKEN, CREDENTIALS, DIGEST: digest } = require('./utils');
+const { COOKIE_NAME, SECURE_COOKIE_NAME, COOKIES, SESSION_MS } = require('./constants');
+const { CREATE_MIDDLEWARE_AUTH_LOAD, MIDDLEWARE_REQUIRE_CSRF } = require('./middlewares');
 // -----------------------------------------------------------------------------------
 
-module.exports.CREATE_AUTH = function (store) {
+module.exports.CREATE_AUTH = function ({ store, config, projects, runner, jobs, billing }) {
+  const cookieName = config.secureCookies ? SECURE_COOKIE_NAME : COOKIE_NAME;
+  const cookies = { ...COOKIES, secure: Boolean(config.secureCookies) };
+  const loadSession = CREATE_MIDDLEWARE_AUTH_LOAD({ store, config });
   async function register(req, res) {
     const { email, password, name } = CREDENTIALS(req.body, true);
     const hash = await PASSWORD_HASH(password);
@@ -22,7 +26,7 @@ module.exports.CREATE_AUTH = function (store) {
       throw error;
     }
 
-    updateSession(req, res, id, store);
+    updateSession(req, res, id, store, cookieName, cookies);
   }
 
   async function login(req, res) {
@@ -33,16 +37,17 @@ module.exports.CREATE_AUTH = function (store) {
       throw new HttpError(401, 'Adresse e-mail ou mot de passe incorrect.');
     }
 
-    updateSession(req, res, user.id, store);
+    updateSession(req, res, user.id, store, cookieName, cookies);
   }
 
   function logout(req, res) {
-    const token = COOKIE_TOKEN(req);
+    const token = COOKIE_TOKEN(req, cookieName);
     if (token) {
       store.run('DELETE FROM sessions WHERE token_hash = ?', digest(token));
     }
 
-    res.clearCookie(COOKIE_NAME, { ...cookies, maxAge: undefined });
+    const { maxAge, ...clearOptions } = cookies;
+    res.clearCookie(cookieName, clearOptions);
     res.status(204).end();
   }
 
@@ -53,7 +58,7 @@ module.exports.CREATE_AUTH = function (store) {
       csrfToken: user ? req.session.csrf : null,
       generationMaxCredits: config.generationMaxCredits,
       microUsdPerCredit: config.aiMicroUsdPerCredit,
-      aiModel: config.openaiModel,
+      aiModel: config.aiderModel,
       storage: user ? projects.storage(user.id) : null,
       billingProvider: 'lemon-squeezy',
       generationEnabled: Boolean(runner.enabled && jobs.available),
@@ -61,18 +66,19 @@ module.exports.CREATE_AUTH = function (store) {
     };
   }
 
-  return { register, login, logout, getSessionInfos };
+  return { register, login, logout, getSessionInfos, loadSession, requireCsrf: MIDDLEWARE_REQUIRE_CSRF };
 }
 
 // -------------------------------------------------------------------------------------------
 // HELPFUL
 // -------------------------------------------------------------------------------------------
 
-function updateSession(req, res, userId, store) {
+function updateSession(req, res, userId, store, cookieName, cookies) {
   const token = crypto.randomBytes(32).toString('hex');
   const csrf = crypto.randomBytes(32).toString('hex');
+  const expiresAt = Date.now() + SESSION_MS;
   store.transaction(() => {
-    const old = module.exports.COOKIE_TOKEN(req);
+    const old = COOKIE_TOKEN(req, cookieName);
     if (old) {
       store.run('DELETE FROM sessions WHERE token_hash = ?', digest(old));
     }
@@ -84,9 +90,9 @@ function updateSession(req, res, userId, store) {
       (SELECT token_hash FROM sessions WHERE user_id = ? ORDER BY expires_at DESC LIMIT 9)`, userId, userId
     );
 
-    store.run('INSERT INTO sessions VALUES (?,?,?,?)', digest(token), userId, csrf, Date.now() + SESSION_MS);
+    store.run('INSERT INTO sessions(token_hash,user_id,csrf,expires_at) VALUES (?,?,?,?)', digest(token), userId, csrf, expiresAt);
   });
 
-  res.cookie(COOKIE_NAME, token, cookies);
-  req.session = { ...store.get('SELECT * FROM users WHERE id = ?', userId), user_id: userId, csrf };
+  res.cookie(cookieName, token, cookies);
+  req.session = { token_hash: digest(token), user_id: userId, csrf, expires_at: expiresAt };
 }

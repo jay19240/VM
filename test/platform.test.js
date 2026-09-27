@@ -6,21 +6,13 @@ const os = require('node:os');
 const path = require('node:path');
 const { randomUUID, randomBytes } = require('node:crypto');
 const { createApplication } = require('../server/app');
-const { createAgentRunner } = require('../server/runner');
 const { loadConfig } = require('../server/config');
 const { Store } = require('../server/store');
-const { createPricing, ceilDiv, safeNumber, DENOMINATOR } = require('../server/ai-pricing');
 const { acquireLock } = require('../server/lock');
 const { fixture: lemonFixture } = require('./lemon-client.test');
 
-function usageRecord(config, inputTokens = 1000) {
-  const pricing = createPricing(config);
-  const { costNumerator, ...tokens } = pricing.usage({ input_tokens: inputTokens,
-    input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, output_tokens: 200,
-    output_tokens_details: { reasoning_tokens: 100 }, total_tokens: inputTokens + 200 });
-  return { responseId: `resp_${randomUUID()}`, model: 'gpt-6-astra', ...tokens,
-    costMicroUsd: safeNumber(ceilDiv(costNumerator, DENOMINATOR)), costNumerator: costNumerator.toString(),
-    costDenominator: DENOMINATOR.toString(), rates: pricing.rates };
+function usageRecord(overrides = {}) {
+  return { costMicroUsd: 20000, inputTokens: 1000, outputTokens: 200, requests: 1, ...overrides };
 }
 
 async function fixture(t, { runner, lemonClient, config: overrides = {} } = {}) {
@@ -34,8 +26,8 @@ async function fixture(t, { runner, lemonClient, config: overrides = {} } = {}) 
   await fs.writeFile(path.join(engineDir, '.env'), 'PRIVATE_TEMPLATE_FILE=fixture\n');
   const dataDir = path.join(temp, 'data');
   const config = { ...loadConfig({ APP_URL: 'http://localhost:3000' }), engineDir, dataDir,
-    databasePath: path.join(dataDir, 'platform.sqlite'), jobTimeoutMs: 1000, aiUid: process.getuid?.() || 1000,
-    aiGid: process.getgid?.() || 1000, generationMaxCredits: 3, aiMicroUsdPerCredit: 10000, ...overrides };
+    databasePath: path.join(dataDir, 'platform.sqlite'), jobTimeoutMs: 1000,
+    generationMaxCredits: 3, aiMicroUsdPerCredit: 10000, ...overrides };
   const platform = await createApplication({ config, runner: runner || { enabled: false }, lemonClient });
   const server = platform.app.listen(0, '127.0.0.1');
   await new Promise(resolve => server.once('listening', resolve));
@@ -83,42 +75,71 @@ async function fixture(t, { runner, lemonClient, config: overrides = {} } = {}) 
   return h;
 }
 
-test('agent chain publishes through Express with one budget, durable plan and private project progress', async t => {
-  const requests = [];
-  const plan = 'Objectif : créer un niveau. Étape : adapter src/game/main.js. Vérification : syntaxe et changement.';
-  const tool = (id, name, args) => ({ id: `fc_${id}`, type: 'function_call', name, call_id: `call_${id}`, arguments: JSON.stringify(args) });
-  const outputs = [
-    [tool('game', 'read_file', { path: 'src/game/main.js', offset: 0, limit: 1000 }),
-      tool('lib', 'read_file', { path: 'src/lib/legacy.js', offset: 0, limit: 1000 }),
-      tool('examples', 'list_files', { scope: 'examples' })],
-    [tool('plan', 'submit_plan', { plan })],
-    [tool('write', 'write_game_file', { path: 'src/game/main.js', content: 'export const level = 2;' })],
-    [{ id: 'msg_done', type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Done' }] }],
-  ];
-  const runner = createAgentRunner({ openaiApiKey: randomBytes(24).toString('hex') }, async (_url, options) => {
-    const index = requests.length; requests.push(JSON.parse(options.body));
-    assert.ok(outputs[index], 'Unexpected extra provider call');
-    return new Response(JSON.stringify({ id: `resp_${index}`, object: 'response', status: 'completed',
-      model: 'gpt-6-astra', service_tier: 'default', output: outputs[index], usage: {
-        input_tokens: 100, input_tokens_details: { cached_tokens: 20, cache_write_tokens: 30 },
-        output_tokens: 10, output_tokens_details: { reasoning_tokens: 2 }, total_tokens: 110 } }));
-  });
+test('simulated Aider session publishes only its validated draft with cumulative usage and private progress', async t => {
+  let release; let calls = 0; let draftReady = false;
+  const gate = new Promise(resolve => { release = resolve; });
+  const runner = { enabled: true, async run(args) {
+    calls++;
+    assert.deepEqual(Object.keys(args).sort(), ['id', 'engineDir', 'gameDir', 'prompt', 'budgetMicroUsd', 'signal', 'onUsage'].sort());
+    const { id, engineDir, gameDir, prompt, budgetMicroUsd, signal, onUsage } = args;
+    assert.equal(prompt, 'Créer un niveau.'); assert.equal(budgetMicroUsd, 2000000n);
+    assert.ok(signal instanceof AbortSignal); assert.equal(signal.aborted, false);
+    const root = path.dirname(engineDir);
+    assert.equal(gameDir, path.join(root, 'generations', id, 'game'));
+    assert.equal(await fs.readFile(path.join(engineDir, 'src/lib/legacy.js'), 'utf8'), 'export const immutable = true;\n');
+    assert.equal(await fs.readFile(path.join(gameDir, 'main.js'), 'utf8'), 'export const level = 1;\n');
+    assert.equal(h.store.get('SELECT agent_phase FROM jobs WHERE id=?', id).agent_phase, 'coding');
+    // Simulate an initial edit followed by a refinement; all reports are session totals.
+    assert.equal(onUsage(usageRecord({ costMicroUsd: 1395, inputTokens: 100, outputTokens: 10 })), true);
+    await fs.writeFile(path.join(gameDir, 'main.js'), 'export const level = 2;');
+    assert.equal(onUsage(usageRecord({ costMicroUsd: 2790, inputTokens: 200, outputTokens: 20, requests: 2 })), true);
+    await fs.writeFile(path.join(gameDir, 'level.json'), JSON.stringify({ enemies: 3 }));
+    const total = usageRecord({ costMicroUsd: 5580, inputTokens: 400, outputTokens: 40, requests: 3 });
+    assert.equal(onUsage(total), true); assert.equal(onUsage({ ...total }), false);
+    draftReady = true;
+    await Promise.race([gate, new Promise((_, reject) => signal.addEventListener('abort',
+      () => reject(new Error('Interrupted test runner')), { once: true }))]);
+  } };
   const h = await fixture(t, { runner, config: { generationMaxCredits: 200, jobTimeoutMs: 5000 } });
   const user = await h.register(); const outsider = await h.register(); h.fund(user, 200);
   const project = await h.createProject(user); const route = `/api/projects/${project.id}/generations`;
   const response = await h.request(route, { method: 'POST', session: user,
     body: { prompt: 'Créer un niveau.', budgetCredits: 200, requestId: randomUUID() } });
   assert.equal(response.status, 202);
-  const initial = (await response.json()).job; const job = await h.wait(initial.id);
-  assert.equal(job.status, 'succeeded'); assert.equal(job.agent_plan, plan); assert.equal(job.agent_phase, 'validating');
-  assert.equal(job.actual_cost, 1); assert.equal(job.provider_cost_micro_usd, 5580);
-  assert.equal(JSON.parse(job.usage_json).requests, 4); assert.equal(requests.length, 4);
+  const initial = (await response.json()).job;
+  for (let tries = 0; tries < 100 && !draftReady; tries++) await new Promise(resolve => setTimeout(resolve, 20));
+  assert.ok(draftReady, 'Aider simulation did not prepare its draft');
+  const root = path.join(h.config.dataDir, 'users', user.user.id, project.id);
+  const live = path.join(root, 'engine/src/game');
+  assert.equal(await fs.readFile(path.join(live, 'main.js'), 'utf8'), 'export const level = 1;\n');
+  await assert.rejects(fs.stat(path.join(live, 'level.json')), { code: 'ENOENT' });
+  const running = (await (await h.request(route, { session: user })).json()).jobs[0];
+  assert.equal(running.status, 'running'); assert.equal(running.phase, 'coding'); assert.equal(running.plan, null);
+  assert.equal(running.costSource, 'aider'); assert.equal(running.chargedCredits, null);
+  assert.equal(running.providerCostMicroUsd, 5580);
+  assert.deepEqual(running.usage, { inputTokens: 400, outputTokens: 40, requests: 3 });
+  assert.equal(h.store.wallet(user.user.id).balance, 200); assert.equal(h.store.wallet(user.user.id).reserved, 200);
+  assert.equal((await h.request(route)).status, 401);
+  assert.equal((await h.request(route, { session: outsider })).status, 404);
+  assert.equal((await h.request(`/api/events?projectId=${project.id}`, { session: outsider })).status, 404);
+  assert.equal((await h.request(`/users/${user.user.id}/${project.id}/generations/${initial.id}/game/main.js`, { session: user })).status, 404);
+  for (const privateValue of [h.config.dataDir, 'pricing_json', 'engineDir', 'gameDir']) {
+    assert.ok(!JSON.stringify(running).includes(privateValue));
+  }
+  release(); const job = await h.wait(initial.id);
+  assert.equal(job.status, 'succeeded'); assert.equal(job.agent_plan, null); assert.equal(job.agent_phase, 'validating');
+  assert.equal(job.actual_cost, 1); assert.equal(job.provider_cost_micro_usd, 5580); assert.equal(calls, 1);
+  assert.deepEqual(JSON.parse(job.usage_json), running.usage);
+  assert.deepEqual(JSON.parse(job.pricing_json), { provider: 'aider' }); assert.equal(job.micro_usd_per_credit, 10000);
+  assert.equal(h.store.get('SELECT count(*) AS n FROM ai_usage WHERE job_id=?', job.id).n, 0);
   assert.equal(h.store.wallet(user.user.id).balance, 199); assert.equal(h.store.wallet(user.user.id).reserved, 0);
   const listed = (await (await h.request(route, { session: user })).json()).jobs[0];
-  assert.equal(listed.plan, plan); assert.equal(listed.phase, 'validating');
+  assert.equal(listed.plan, null); assert.equal(listed.phase, 'validating'); assert.equal(listed.costSource, 'aider');
   assert.equal((await h.request(route, { session: outsider })).status, 404);
-  const live = path.join(h.config.dataDir, 'users', user.user.id, project.id, 'engine/src/game/main.js');
-  assert.equal(await fs.readFile(live, 'utf8'), 'export const level = 2;');
+  assert.equal(await fs.readFile(path.join(live, 'main.js'), 'utf8'), 'export const level = 2;');
+  assert.deepEqual(JSON.parse(await fs.readFile(path.join(live, 'level.json'), 'utf8')), { enemies: 3 });
+  assert.equal(await fs.readFile(path.join(root, 'generations', job.id, 'previous/main.js'), 'utf8'), 'export const level = 1;\n');
+  assert.equal(await fs.readFile(path.join(root, 'engine/src/lib/legacy.js'), 'utf8'), 'export const immutable = true;\n');
   assert.equal(await fs.readFile(path.join(h.engineDir, 'src/game/main.js'), 'utf8'), 'export const level = 1;\n');
 });
 
@@ -224,11 +245,11 @@ test('generation disabled fails before reservation; enabled insufficient credit 
 test('generation reserves once, idempotent HTTP retries, locks project and debits only after publication', async t => {
   let release; let calls = 0;
   const gate = new Promise(resolve => { release = resolve; });
-  const h = await fixture(t, { runner: { enabled: true, async run({ id, gameDir, budgetCredits, onUsage, signal }) {
-    calls++; assert.equal(budgetCredits, 3);
+  const h = await fixture(t, { runner: { enabled: true, async run({ id, gameDir, budgetMicroUsd, onUsage, signal }) {
+    calls++; assert.equal(budgetMicroUsd, 30000n);
     await Promise.race([gate, new Promise((_, reject) => signal.addEventListener('abort',
       () => reject(new Error('Interrupted test runner')), { once: true }))]);
-    const usage = usageRecord(h.config);
+    const usage = usageRecord();
     assert.equal(usage.costMicroUsd, 20000);
     assert.equal(onUsage(usage), true);
     assert.equal(h.store.get('SELECT provider_cost_micro_usd FROM jobs WHERE id = ?', id).provider_cost_micro_usd, 20000);
@@ -251,11 +272,10 @@ test('generation reserves once, idempotent HTTP retries, locks project and debit
   assert.equal(h.store.wallet(user.user.id).balance, 10); assert.equal(h.store.wallet(user.user.id).reserved, 0);
   assert.equal(h.store.wallet(user.user.id).available, 10);
   assert.equal(job.billing_mode, 'metered'); assert.equal(job.micro_usd_per_credit, 10000);
-  assert.deepEqual(JSON.parse(job.pricing_json), createPricing(h.config).rates);
+  assert.deepEqual(JSON.parse(job.pricing_json), { provider: 'aider' });
   assert.equal(job.cost, 3); assert.equal(job.actual_cost, 2); assert.equal(job.provider_cost_micro_usd, 20000);
-  assert.deepEqual(JSON.parse(job.usage_json), { inputTokens: 1000, cachedInputTokens: 0,
-    cacheWriteInputTokens: 0, outputTokens: 200, reasoningTokens: 100, requests: 1 });
-  assert.equal(h.store.get('SELECT count(*) AS n FROM ai_usage WHERE job_id = ?', job.id).n, 1);
+  assert.deepEqual(JSON.parse(job.usage_json), { inputTokens: 1000, outputTokens: 200, requests: 1 });
+  assert.equal(h.store.get('SELECT count(*) AS n FROM ai_usage WHERE job_id = ?', job.id).n, 0);
   assert.deepEqual({ ...h.store.get('SELECT amount,reserved_delta FROM ledger WHERE reference = ?', `job:${job.id}:finish`) },
     { amount: -2, reserved_delta: -3 });
   assert.equal((await h.request(route, { method: 'POST', session: user, body: { ...body, budgetCredits: 2 } })).status, 409);
@@ -265,7 +285,7 @@ test('generation reserves once, idempotent HTTP retries, locks project and debit
   const view = (await replay.json()).job;
   assert.equal(view.id, job.id); assert.equal(calls, 1);
   assert.equal(view.reservedCost, 3); assert.equal(view.chargedCredits, 2); assert.equal(view.providerCostMicroUsd, 20000);
-  assert.deepEqual(view.usage, JSON.parse(job.usage_json));
+  assert.deepEqual(view.usage, JSON.parse(job.usage_json)); assert.equal(view.costSource, 'aider');
   assert.equal(h.store.get('SELECT count(*) AS n FROM ledger WHERE reference = ?', `job:${job.id}:finish`).n, 1);
   const source = await fs.readFile(path.join(h.engineDir, 'src/game/main.js'), 'utf8'); assert.equal(source, 'export const level = 1;\n');
   const gameRoot = path.join(h.config.dataDir, 'users', user.user.id, project.id);
@@ -284,7 +304,7 @@ test('failures, no-op, invalid syntax, symlinks and timeout release reservations
   ];
   for (let index = 0; index < scenarios.length; index++) await t.test(`scenario ${index}`, async t => {
     const h = await fixture(t, { runner: { enabled: true, async run(args) {
-      assert.equal(args.onUsage(usageRecord(h.config)), true);
+      assert.equal(args.onUsage(usageRecord()), true);
       return scenarios[index](args);
     } }, config: { jobTimeoutMs: 1000 } });
     const user = await h.register(); const project = await h.createProject(user); h.fund(user);
@@ -294,7 +314,7 @@ test('failures, no-op, invalid syntax, symlinks and timeout release reservations
     assert.equal(h.store.wallet(user.user.id).balance, 12); assert.equal(h.store.wallet(user.user.id).reserved, 0);
     assert.equal(job.actual_cost, 0); assert.equal(job.provider_cost_micro_usd, 20000);
     assert.equal(JSON.parse(job.usage_json).requests, 1);
-    assert.equal(h.store.get('SELECT count(*) AS n FROM ai_usage WHERE job_id = ?', id).n, 1);
+    assert.equal(h.store.get('SELECT count(*) AS n FROM ai_usage WHERE job_id = ?', id).n, 0);
     assert.equal(await fs.readFile(path.join(h.config.dataDir, 'users', user.user.id, project.id, 'engine/src/game/main.js'), 'utf8'), 'export const level = 1;\n');
   });
 });
@@ -438,9 +458,9 @@ test('generation budgets reject invalid values before reservation or runner invo
 
 test('valid explicit and omitted generation budgets reach the runner and settle actual usage', async t => {
   const budgets = [];
-  const h = await fixture(t, { runner: { enabled: true, async run({ gameDir, budgetCredits, onUsage }) {
-    budgets.push(budgetCredits);
-    assert.equal(onUsage(usageRecord(h.config, 0)), true);
+  const h = await fixture(t, { runner: { enabled: true, async run({ gameDir, budgetMicroUsd, onUsage }) {
+    budgets.push(budgetMicroUsd);
+    assert.equal(onUsage(usageRecord({ costMicroUsd: 10000, inputTokens: 0 })), true);
     await fs.writeFile(path.join(gameDir, 'main.js'), `export const level = ${budgets.length + 1};`);
   } } });
   const user = await h.register(); const project = await h.createProject(user); h.fund(user);
@@ -453,7 +473,7 @@ test('valid explicit and omitted generation budgets reach the runner and settle 
     assert.equal(job.status, 'succeeded'); assert.equal(job.cost, budgetCredits ?? 3);
     assert.equal(job.actual_cost, 1); assert.equal(job.provider_cost_micro_usd, 10000);
   }
-  assert.deepEqual(budgets, [1, 2, 3, 3]);
+  assert.deepEqual(budgets, [10000n, 20000n, 30000n, 30000n]);
   assert.equal(h.store.wallet(user.user.id).balance, 8); assert.equal(h.store.wallet(user.user.id).reserved, 0);
   const view = await (await h.request('/api/session', { session: user })).json();
   assert.equal(view.generationMaxCredits, 3); assert.equal(view.microUsdPerCredit, 10000);
@@ -464,8 +484,8 @@ for (const scenario of ['missing-usage', 'invalid-usage', 'over-budget', 'failur
     const h = await fixture(t, { runner: { enabled: true, async run({ gameDir, onUsage }) {
       await fs.writeFile(path.join(gameDir, 'main.js'), 'export const level = 2;');
       if (scenario === 'missing-usage') return;
-      const record = usageRecord(h.config, scenario === 'over-budget' ? 3000 : 1000);
-      if (scenario === 'invalid-usage') record.costNumerator = '0';
+      const record = usageRecord({ costMicroUsd: scenario === 'over-budget' ? 40000 : 20000 });
+      if (scenario === 'invalid-usage') record.costMicroUsd = '20000';
       assert.equal(onUsage(record), true);
       if (scenario === 'failure-after-usage') throw new Error('private diagnostic must not escape');
     } } });
@@ -479,7 +499,7 @@ for (const scenario of ['missing-usage', 'invalid-usage', 'over-budget', 'failur
     assert.ok(!job.error.includes('private'));
     const recorded = ['over-budget', 'failure-after-usage'].includes(scenario);
     assert.equal(job.provider_cost_micro_usd, scenario === 'over-budget' ? 40000 : recorded ? 20000 : 0);
-    assert.equal(h.store.get('SELECT count(*) AS n FROM ai_usage WHERE job_id=?', job.id).n, recorded ? 1 : 0);
+    assert.equal(h.store.get('SELECT count(*) AS n FROM ai_usage WHERE job_id=?', job.id).n, 0);
     assert.equal(JSON.parse(job.usage_json)?.requests ?? 0, recorded ? 1 : 0);
     assert.equal(h.store.wallet(user.user.id).balance, 12); assert.equal(h.store.wallet(user.user.id).reserved, 0);
     assert.deepEqual({ ...h.store.get('SELECT amount,reserved_delta,kind FROM ledger WHERE reference=?', `job:${job.id}:finish`) },

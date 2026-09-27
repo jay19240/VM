@@ -6,6 +6,7 @@ const vm = require('node:vm');
 const { randomUUID, randomBytes } = require('node:crypto');
 const html = fs.readFileSync(require.resolve('../web/index.html'), 'utf8');
 const script = fs.readFileSync(require.resolve('../web/app.js'), 'utf8');
+const styles = fs.readFileSync(require.resolve('../web/styles.css'), 'utf8');
 
 // Lightweight DOM contract tests, not a substitute for a real browser/visual test.
 class Node {
@@ -57,7 +58,7 @@ async function fixture({ packs = [], plans = [], subscription = null, purchaseRe
   }
   const session = { user: { id: randomUUID(), name: '<img src=x onerror=alert(1)>', email: 'fixture@example.test', credits: 20, reservedCredits: 3 },
     csrfToken: randomBytes(32).toString('hex'), generationMaxCredits: 200, generationEnabled: true, billingEnabled: true,
-    billingProvider: 'lemon-squeezy', aiModel: 'gpt-6-astra', microUsdPerCredit: 10000,
+    billingProvider: 'lemon-squeezy', aiModel: 'anthropic/claude-sonnet-4-6', microUsdPerCredit: 10000,
     storage: { usedBytes: 1024 ** 2, limitBytes: 1024 ** 3, maxProjects: 10 }, ...sessionOverrides };
   let authenticated = false;
   const context = vm.createContext({
@@ -235,7 +236,16 @@ test('generation budget defaults to min(50, maximum, available), with a disabled
     assert.equal(h.nodes.get('generation-budget').value, expected);
     assert.equal(h.nodes.get('generation-budget').max, String(maximum));
     assert.equal(h.nodes.get('generate').disabled, credits === 0);
-    assert.match(h.nodes.get('ai-model').textContent, /OpenAI · gpt-6-astra/);
+    assert.equal(h.nodes.get('ai-model').textContent, 'Aider · anthropic/claude-sonnet-4-6');
+  }
+});
+
+test('the Aider model badge uses the configured session model as text and the Sonnet fallback', async () => {
+  for (const aiModel of ['provider/configured-model', '<img src=x onerror=alert(1)>', '', undefined]) {
+    const h = await generationFixture({ sessionOverrides: { aiModel } });
+    const badge = h.nodes.get('ai-model');
+    assert.equal(badge.textContent, `Aider · ${aiModel || 'anthropic/claude-sonnet-4-6'}`);
+    assert.equal(badge.children.length, 0);
   }
 });
 
@@ -250,6 +260,10 @@ test('refreshes preserve the chosen or cleared budget and use dynamic USD conver
   assert.match(h.nodes.get('generation-price').textContent, /US\$0\.025/);
   assert.match(h.nodes.get('generation-price').textContent, /US\$0\.15/);
   assert.match(h.nodes.get('credit-conversion').textContent, /USD.*EUR.*pas d’un taux de change/);
+  assert.match(h.nodes.get('credit-conversion').textContent, /coût estimé par Aider, pas une facture fournisseur exacte/);
+  assert.match(h.nodes.get('generation-price').textContent, /coût estimé par Aider.*Plafond de débit réservé : 6 crédit\(s\)/);
+  assert.match(h.nodes.get('generation-price').textContent, /limite les crédits débitables, pas les dépenses du fournisseur/);
+  assert.doesNotMatch(h.nodes.get('credit-conversion').textContent + h.nodes.get('generation-price').textContent, /OpenAI/);
   h.session.generationMaxCredits = 5;
   await h.context.refreshSession();
   assert.equal(h.nodes.get('generation-budget').value, '6');
@@ -286,7 +300,9 @@ test('invalid or unaffordable budgets never POST, including direct form submissi
     assert.equal(h.nodes.get('generation-budget').value, String(budget));
   }
   assert.equal(generationPosts(h).length, 3);
-  assert.match(h.nodes.get('notice').textContent, /publication réussie.*reste sera libéré.*aucun débit/);
+  assert.match(h.nodes.get('notice').textContent, /coût estimé par Aider.*converti en crédits, arrondi au crédit supérieur.*publication réussie.*reste sera libéré/);
+  assert.match(h.nodes.get('notice').textContent, /Échec, aucun changement publié, estimation manquante ou budget dépassé : aucun débit/);
+  assert.doesNotMatch(h.nodes.get('notice').textContent, /OpenAI|coût réel/);
 });
 
 test('generation guards also block disabled AI, unready projects, active jobs and insufficient unreserved credits', async () => {
@@ -326,7 +342,7 @@ test('uncertain generation retries keep their ID and budget; changed budget or p
   assert.equal(h.nodes.get('prompt').value, '');
 });
 
-test('job history displays actual debit, released ceiling, provider USD and every usage field without unsafe HTML', async () => {
+test('legacy job history retains historical OpenAI costs, actual debit and every usage field without unsafe HTML', async () => {
   const usage = { inputTokens: 123, cachedInputTokens: 45, cacheWriteInputTokens: 6,
     outputTokens: 78, reasoningTokens: 9, requests: 2 };
   const jobs = [
@@ -335,12 +351,12 @@ test('job history displays actual debit, released ceiling, provider USD and ever
     { status: 'failed', cost: 20, reservedCost: 20, chargedCredits: 0, providerCostMicroUsd: 24000, usage,
       error: '<img src=x onerror=alert(1)>' },
     { status: 'failed', cost: 10, reservedCost: 10, chargedCredits: 0, providerCostMicroUsd: 0, usage: {}, error: 'Aucun changement' },
-  ].map(job => ({ ...job, prompt: '<script>untrusted()</script>', createdAt: projectFixture.createdAt }));
+  ].map(job => ({ ...job, costSource: 'legacy', prompt: '<script>untrusted()</script>', createdAt: projectFixture.createdAt }));
   const h = await generationFixture({ jobs });
   const rows = h.nodes.get('job-list').children;
   assert.equal(rows.length, 4);
   assert.match(rows[0].textContent, /13 crédit\(s\) débité\(s\) · plafond 50 · 37 libéré\(s\)/);
-  assert.match(rows[0].textContent, /US\$0\.120001/);
+  assert.match(rows[0].textContent, /Usage OpenAI historique : US\$0\.120001/);
   for (const text of ['entrée : 123', 'entrée en cache : 45', 'écriture du cache : 6', 'sortie : 78', 'raisonnement : 9', 'requêtes : 2']) {
     assert.ok(rows[0].textContent.includes(text), text);
   }
@@ -351,66 +367,126 @@ test('job history displays actual debit, released ceiling, provider USD and ever
   assert.match(rows[2].textContent, /US\$0\.024 · non facturé au client/);
   assert.match(rows[2].textContent, /<img src=x onerror=alert\(1\)>/);
   assert.match(rows[3].textContent, /0 crédit débité · 10 crédit\(s\) libéré/);
-  assert.doesNotMatch(h.nodes.get('job-list').textContent, /NaN|undefined/);
+  assert.doesNotMatch(h.nodes.get('job-list').textContent, /NaN|undefined|Coût estimé par Aider/);
+  delete jobs[0].costSource;
+  await h.context.loadJobs();
+  assert.match(h.nodes.get('job-list').children[0].textContent, /Usage OpenAI historique : US\$0\.120001/);
 });
 
-test('running jobs display each French agent phase, while legacy and terminal statuses retain their labels', async () => {
+test('Aider history shows estimates and server-settled credits without a technical token breakdown', async () => {
+  const usage = { inputTokens: 123, outputTokens: 78, requests: 2 };
+  const jobs = [
+    { status: 'succeeded', cost: 13, reservedCost: 50, chargedCredits: 13, providerCostMicroUsd: 120001, usage },
+    { status: 'running', phase: 'coding', cost: 30, reservedCost: 30, chargedCredits: null, providerCostMicroUsd: 20000, usage },
+    { status: 'queued', cost: 10, reservedCost: 10, chargedCredits: null, providerCostMicroUsd: 0, usage: null },
+    { status: 'succeeded', cost: 0, reservedCost: 10, chargedCredits: 0, providerCostMicroUsd: 0,
+      usage: { inputTokens: 0, outputTokens: 0, requests: 1 } },
+  ].map(job => ({ ...job, costSource: 'aider', prompt: '<script>untrusted()</script>', createdAt: projectFixture.createdAt }));
+  const h = await generationFixture({ jobs });
+  const rows = h.nodes.get('job-list').children;
+  assert.equal(rows.length, 4);
+  assert.match(rows[0].textContent, /13 crédit\(s\) débité\(s\) · plafond 50 · 37 libéré\(s\)/);
+  assert.match(rows[0].textContent, /Coût estimé par Aider : US\$0\.120001/);
+  assert.match(rows[0].textContent, /<script>untrusted\(\)<\/script>/);
+  assert.match(rows[1].textContent, /30 crédit\(s\) réservé\(s\) · débit réel en attente/);
+  assert.match(rows[1].textContent, /Coût estimé par Aider : US\$0\.02/);
+  assert.doesNotMatch(rows[1].textContent, /débité/);
+  assert.match(rows[2].textContent, /10 crédit\(s\) réservé\(s\)/);
+  assert.match(rows[2].textContent, /Coût estimé par Aider : indisponible/);
+  assert.doesNotMatch(rows[2].textContent, /US\$|débité/);
+  assert.match(rows[3].textContent, /0 crédit\(s\) débité\(s\) · plafond 10 · 10 libéré\(s\)/);
+  assert.match(rows[3].textContent, /Coût estimé par Aider : US\$0\.00/);
+  assert.doesNotMatch(h.nodes.get('job-list').textContent, /OpenAI|Tokens|entrée|sortie|cache|raisonnement|requêtes|NaN|undefined/);
+});
+
+test('Aider failures, no change, missing estimates and overbudget results display no debit, never success', async () => {
+  const usage = { inputTokens: 100, outputTokens: 10, requests: 1 };
+  const jobs = [
+    { providerCostMicroUsd: 24000, usage, error: '<img src=x onerror=alert(1)>' },
+    { providerCostMicroUsd: 24000, usage, error: 'Aucun changement publié' },
+    { providerCostMicroUsd: null, usage: null, error: 'Estimation manquante' },
+    { providerCostMicroUsd: 0, usage: null, error: 'Estimation manquante' },
+    { providerCostMicroUsd: 510000, usage, error: 'Budget dépassé' },
+  ].map(job => ({ ...job, status: 'failed', cost: 50, reservedCost: 50, chargedCredits: 0,
+    costSource: 'aider', prompt: 'Une idée', createdAt: projectFixture.createdAt }));
+  const h = await generationFixture({ jobs });
+  const rows = h.nodes.get('job-list').children;
+  assert.equal(rows.length, jobs.length);
+  rows.forEach((row, index) => {
+    assert.equal(row.children[0].children[0].textContent, 'Échec');
+    assert.match(row.textContent, /0 crédit débité · 50 crédit\(s\) libéré/);
+    assert.ok(row.textContent.includes(jobs[index].error));
+    assert.doesNotMatch(row.textContent, /Appliquée|OpenAI|Tokens/);
+  });
+  for (const index of [0, 1, 4]) assert.match(rows[index].textContent, /Coût estimé par Aider : US\$.*non facturé au client/);
+  for (const index of [2, 3]) {
+    assert.match(rows[index].textContent, /Coût estimé par Aider : indisponible/);
+    assert.doesNotMatch(rows[index].textContent, /US\$/);
+  }
+  assert.match(rows[4].textContent, /US\$0\.51/);
+  assert.equal(h.nodes.get('credit-balance').textContent, '17', 'rendering must not settle the wallet locally');
+});
+
+test('history keeps status labels and only shows coding, validation and publication phases for running jobs', async () => {
   const cases = [
-    [{ status: 'running', phase: 'planning' }, 'Analyse du prompt'],
-    [{ status: 'running', phase: 'coding' }, 'Écriture du jeu'],
-    [{ status: 'running', phase: 'validating' }, 'Vérification'],
-    [{ status: 'running', phase: 'publishing' }, 'Publication'],
-    [{ status: 'running' }, 'Création en cours'],
-    [{ status: 'running', phase: null, plan: null }, 'Création en cours'],
-    [{ status: 'running', phase: '<img src=x onerror=alert(1)>' }, 'Création en cours'],
-    [{ status: 'running', phase: '__proto__' }, 'Création en cours'],
+    [{ status: 'running', phase: 'planning', costSource: 'legacy' }, 'En cours'],
+    [{ status: 'running', phase: 'planning' }, 'En cours'],
+    [{ status: 'running', phase: 'coding' }, 'En cours', 'Écriture du jeu'],
+    [{ status: 'running', phase: 'validating' }, 'En cours', 'Vérification'],
+    [{ status: 'running', phase: 'publishing' }, 'En cours', 'Publication'],
+    [{ status: 'running' }, 'En cours'],
+    [{ status: 'running', phase: null, plan: null }, 'En cours'],
+    [{ status: 'running', phase: '<img src=x onerror=alert(1)>' }, 'En cours'],
+    [{ status: 'running', phase: '__proto__' }, 'En cours'],
     [{ status: 'queued' }, 'En attente'],
     [{ status: 'succeeded', phase: 'validating' }, 'Appliquée'],
-    [{ status: 'failed', phase: 'coding' }, 'Non facturée'],
+    [{ status: 'failed', phase: 'coding' }, 'Échec'],
   ];
-  const jobs = cases.map(([job], index) => ({ id: `job-${index}`, cost: 8, prompt: 'Une idée',
+  const jobs = cases.map(([job], index) => ({ id: `job-${index}`, cost: 8, costSource: 'aider', prompt: 'Une idée',
     createdAt: projectFixture.createdAt, ...job }));
   const h = await generationFixture({ jobs });
   const rows = h.nodes.get('job-list').children;
   assert.equal(rows.length, cases.length);
-  cases.forEach(([, label], index) => {
-    assert.equal(rows[index].children[0].children[0].textContent, label);
+  cases.forEach(([, label, phase], index) => {
+    const meta = rows[index].children[0];
+    assert.equal(meta.children[0].textContent, label);
+    assert.equal(meta.children.length, phase ? 3 : 2);
+    if (phase) assert.equal(meta.children[1].textContent, phase);
     assert.ok(!rows[index].children.some(node => node.tagName === 'DETAILS'));
   });
-  assert.doesNotMatch(h.nodes.get('job-list').textContent, /NaN|undefined|\[object Object\]/);
+  assert.doesNotMatch(h.nodes.get('job-list').textContent, /Analyse du prompt|planning|NaN|undefined|\[object Object\]/);
 });
 
-test('public plans are collapsed native details and render markup, links and line breaks only as text', async () => {
+test('plans are not displayed, even when historical or new jobs contain untrusted plan markup', async () => {
   const plan = '  Plan 🎮\n\t<img src=x onerror=alert(1)>\r\n</details><script>untrusted()</script>\n[ouvrir](javascript:alert(1)) &lt;b&gt;  ';
-  const jobs = ['running', 'succeeded', 'failed'].map((status, index) => ({ id: `job-${index}`, status,
-    phase: 'coding', plan, prompt: 'Une idée', cost: 8, createdAt: projectFixture.createdAt }));
-  const h = await generationFixture({ jobs });
-  for (const row of h.nodes.get('job-list').children) {
-    const details = row.children.find(node => node.tagName === 'DETAILS');
-    assert.ok(details); assert.equal(details.open, false);
-    assert.equal(details.children.length, 2);
-    assert.equal(details.children[0].tagName, 'SUMMARY');
-    assert.equal(details.children[0].textContent, 'Plan de création');
-    assert.equal(details.children[1].tagName, 'P');
-    assert.equal(details.children[1].textContent, plan);
-    assert.equal(details.children[1].children.length, 0, 'untrusted plan must create no child elements');
-    assert.equal(details.children[1].attributes.size, 0);
+  for (const costSource of ['aider', 'legacy']) {
+    const jobs = ['queued', 'running', 'succeeded', 'failed'].map((status, index) => ({ id: `job-${index}`, status,
+      costSource, phase: 'coding', plan, prompt: 'Une idée', cost: 8, createdAt: projectFixture.createdAt }));
+    const h = await generationFixture({ jobs });
+    for (const row of h.nodes.get('job-list').children) {
+      assert.ok(!row.children.some(node => node.tagName === 'DETAILS' || node.tagName === 'SUMMARY'));
+      assert.doesNotMatch(row.textContent, /Plan 🎮|Plan de création|<img|<script>|javascript:|&lt;b&gt;/);
+      assert.match(row.textContent, /Une idée/);
+    }
   }
 });
 
-test('explicit job refresh preserves plan expansion through phase changes and switching projects resets it', async () => {
-  const jobs = [{ id: 'job-1', status: 'running', phase: 'coding', plan: 'Plan public', cost: 8,
+test('explicit refresh and project reselection update phases without plan UI or expansion state', async () => {
+  const jobs = [{ id: 'job-1', status: 'running', costSource: 'aider', phase: 'coding', plan: 'Plan public', cost: 8,
     prompt: 'Une idée', createdAt: projectFixture.createdAt }];
   const h = await generationFixture({ jobs });
-  const details = () => h.nodes.get('job-list').children[0].children.find(node => node.tagName === 'DETAILS');
-  details().open = true; details().events.get('toggle')();
-  jobs[0].phase = 'validating'; await h.context.loadJobs();
-  assert.equal(details().open, true);
-  assert.match(h.nodes.get('job-list').textContent, /Vérification/);
-  details().open = false; details().events.get('toggle')();
-  await h.context.loadJobs(); assert.equal(details().open, false);
-  details().open = true; details().events.get('toggle')();
-  await h.context.selectProject(projectFixture.id); assert.equal(details().open, false);
+  for (const [phase, label] of [['coding', 'Écriture du jeu'], ['validating', 'Vérification'], ['publishing', 'Publication']]) {
+    jobs[0].phase = phase; await h.context.loadJobs();
+    const row = h.nodes.get('job-list').children[0];
+    assert.equal(row.children[0].children[0].textContent, 'En cours');
+    assert.equal(row.children[0].children[1].textContent, label);
+    assert.ok(!row.children.some(node => node.tagName === 'DETAILS'));
+    assert.doesNotMatch(row.textContent, /Plan public/);
+  }
+  await h.context.selectProject(projectFixture.id);
+  assert.match(h.nodes.get('job-list').textContent, /Publication/);
+  assert.doesNotMatch(h.nodes.get('job-list').textContent, /Plan public/);
+  assert.equal(vm.runInContext('Object.hasOwn(state, "expandedPlans")', h.context), false);
 });
 
 test('absent, empty and non-string plans never create a disclosure or stringify provider data', async () => {
@@ -421,11 +497,21 @@ test('absent, empty and non-string plans never create a disclosure or stringify 
   assert.doesNotMatch(h.nodes.get('job-list').textContent, /undefined|null|\[object Object\]|raw output/);
 });
 
-test('prompt hints explain preparation, coding, validation and one shared budget without changing settlement terms', () => {
-  assert.match(html, /L’IA prépare un plan, puis écrit le code ; le jeu est vérifié avant publication/);
-  assert.match(html, /Un seul budget est partagé entre toutes les étapes : préparation du plan, écriture du code et validation avant publication/);
-  assert.match(html, /Après publication réussie, seul le coût total réel OpenAI en USD est débité/);
-  assert.match(html, /Échec ou aucun changement publié : aucun débit/);
+test('generation needs only a prompt and budget after project selection and discloses Aider settlement limits', () => {
+  const promptForm = html.match(/<form id="prompt-form"[\s\S]*?<\/form>/)[0];
+  const fields = [...promptForm.matchAll(/<(?:input|textarea|select)\b[^>]*\bid="([^"]+)"/g)].map(match => match[1]);
+  assert.deepEqual(fields, ['prompt', 'generation-budget']);
+  assert.match(promptForm, /Aider · anthropic\/claude-sonnet-4-6/);
+  assert.match(promptForm, /Aider écrit le code ; le jeu est vérifié avant publication/);
+  assert.match(promptForm, /budget choisi est réservé avant la création, pas facturé d’avance/);
+  assert.match(promptForm, /Après publication réussie, le coût estimé par Aider en USD est converti en crédits, arrondi au crédit supérieur ; le reste est libéré/);
+  assert.match(promptForm, /Échec, aucun changement publié, estimation manquante ou budget dépassé : aucun débit, réservation libérée/);
+  assert.match(promptForm, /Cette estimation n’est pas une facture fournisseur exacte/);
+  assert.match(promptForm, /sans garantir un plafond strict des dépenses du fournisseur/);
+  assert.doesNotMatch(html + script, /prépare un plan|préparation du plan|Plan de création|expandedPlans|job\.plan|job-plan|planning|Analyse du prompt/);
+  assert.doesNotMatch(html, /OpenAI|gpt-6-astra/);
+  assert.doesNotMatch(styles, /\.job-plan/);
+  assert.match(styles, /\.plan-grid\{/); assert.match(styles, /\.plan\{/);
 });
 
 test('shared global storage and project limits refresh, and plan cards show server quotas and EUR minor-unit prices', async () => {
@@ -527,7 +613,7 @@ test('billing return query parameters never grant credits or create checkouts', 
 const posts = h => h.calls.filter(call => call.options?.method === 'POST');
 const stateValue = (h, expression) => vm.runInContext(expression, h.context);
 
-test('one authenticated same-origin SSE stream replaces jobs, plans, quotas and wallet, preserving session settings', async () => {
+test('one authenticated same-origin SSE stream replaces jobs, quotas and wallet without plan UI, preserving session settings', async () => {
   const h = await fixture({ projects: [projectFixture] });
   assert.equal(h.streams.length, 0, 'guests must not open an authenticated stream');
   await login(h);
@@ -538,24 +624,27 @@ test('one authenticated same-origin SSE stream replaces jobs, plans, quotas and 
   assert.equal(initial.closed, true);
   assert.equal(source.url, '/api/events?projectId=project-1');
   const job = { id: 'job-live', status: 'running', phase: 'coding', plan: '<script>Plan public</script>',
-    prompt: 'Une idée', cost: 8, createdAt: projectFixture.createdAt };
+    costSource: 'aider', providerCostMicroUsd: 12000, usage: { inputTokens: 100, outputTokens: 20, requests: 1 },
+    prompt: 'Une idée', cost: 8, reservedCost: 8, createdAt: projectFixture.createdAt };
   setBudget(h, 6);
   source.emit('snapshot', h.snapshot({ jobs: [job], user: { ...h.session.user, credits: 80, reservedCredits: 8 },
     storage: { usedBytes: 2048, limitBytes: 4096, maxProjects: 1 },
     wallet: { balance: 80, reserved: 8, available: 72, entries: [{ amount: 60, description: 'Crédits reçus', createdAt: projectFixture.createdAt }] } }));
-  assert.match(h.nodes.get('job-list').textContent, /Écriture du jeu.*<script>Plan public<\/script>/);
+  assert.match(h.nodes.get('job-list').textContent, /En cours.*Écriture du jeu/);
+  assert.match(h.nodes.get('job-list').textContent, /Coût estimé par Aider : US\$0\.012/);
+  assert.doesNotMatch(h.nodes.get('job-list').textContent, /Plan public|OpenAI|Tokens/);
   assert.equal(h.nodes.get('credit-balance').textContent, '72');
   assert.equal(h.nodes.get('wallet-available').textContent, '72');
   assert.equal(h.nodes.get('wallet-reserved').textContent, '8');
   assert.match(h.nodes.get('ledger').textContent, /Crédits reçus.*\+60/);
   assert.match(h.nodes.get('storage-summary').textContent, /2 Kio \/ 4 Kio/);
   assert.equal(h.nodes.get('new-project').disabled, true);
-  const details = h.nodes.get('job-list').children[0].children.find(node => node.tagName === 'DETAILS');
-  details.open = true; details.events.get('toggle')();
-  source.emit('snapshot', h.snapshot({ jobs: [{ ...job, status: 'succeeded', chargedCredits: 2 }],
+  assert.ok(!h.nodes.get('job-list').children[0].children.some(node => node.tagName === 'DETAILS'));
+  source.emit('snapshot', h.snapshot({ jobs: [{ ...job, status: 'succeeded', cost: 2, chargedCredits: 2 }],
     projects: [{ ...projectFixture, name: 'Nom actualisé' }], generationEnabled: false }));
-  assert.match(h.nodes.get('job-list').textContent, /Appliquée.*2 crédit\(s\) débité/);
-  assert.equal(h.nodes.get('job-list').children[0].children.find(node => node.tagName === 'DETAILS').open, true);
+  assert.match(h.nodes.get('job-list').textContent, /Appliquée.*2 crédit\(s\) débité.*plafond 8 · 6 libéré/);
+  assert.doesNotMatch(h.nodes.get('job-list').textContent, /Plan public|Écriture du jeu|Tokens/);
+  assert.ok(!h.nodes.get('job-list').children[0].children.some(node => node.tagName === 'DETAILS'));
   assert.equal(h.nodes.get('selected-project').textContent, 'Nom actualisé');
   assert.equal(h.nodes.get('generation-disabled').hidden, false);
   assert.equal(h.nodes.get('generate').disabled, true);
@@ -564,6 +653,8 @@ test('one authenticated same-origin SSE stream replaces jobs, plans, quotas and 
   assert.equal(stateValue(h, 'state.session.billingEnabled'), true);
   assert.equal(stateValue(h, 'state.session.generationMaxCredits'), 200);
   assert.equal(stateValue(h, 'state.session.aiModel'), h.session.aiModel);
+  assert.equal(h.nodes.get('ai-model').textContent, `Aider · ${h.session.aiModel}`);
+  assert.equal(stateValue(h, 'state.session.microUsdPerCredit'), h.session.microUsdPerCredit);
   source.emit('snapshot', h.snapshot({ projects: [], jobs: [] }));
   assert.equal(stateValue(h, 'state.projects.length'), 0);
   assert.equal(stateValue(h, 'state.jobs.length'), 0);

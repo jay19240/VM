@@ -5,6 +5,7 @@ const { randomUUID } = require('node:crypto');
 const { HttpError } = require('./errors');
 const { timestamp } = require('./store');
 const { UUID } = require('./constants');
+const { CHECK_PATH, FILE_EXISTS } = require('./utils');
 // -----------------------------------------------------------------------------------
 
 
@@ -44,7 +45,7 @@ function createProjects({ store, config, entitlements = () => null }) {
   }
 
   function assertOwnProject(userId, id) {
-    const row = this.get('SELECT * FROM projects WHERE id = ? AND user_id = ?', id, userId);
+    const row = store.get('SELECT * FROM projects WHERE id = ? AND user_id = ?', id, userId);
     if (!row) throw new HttpError(404, 'Projet introuvable.');
     return row;
   }
@@ -69,7 +70,7 @@ function createProjects({ store, config, entitlements = () => null }) {
       const game = await fs.lstat(path.join(root, 'engine/src/game'));
       if (!game.isDirectory() || game.isSymbolicLink()) throw new Error('Invalid game template');
       store.run("UPDATE projects SET status = 'ready', updated_at = ? WHERE id = ?", timestamp(), id);
-      return store.assertOwnProject(userId, id);
+      return assertOwnProject(userId, id);
     } catch {
       store.run("UPDATE projects SET status = 'failed' WHERE id = ?", id);
       throw new HttpError(500, 'La copie du moteur a échoué. Le projet est conservé pour diagnostic.');
@@ -89,14 +90,14 @@ function createProjects({ store, config, entitlements = () => null }) {
     }
     // Serialize uploads across every project of one owner as well as against that project's generation.
     return exclusive(`assets:${userId}`, () => exclusive(projectId, async () => {
-      const project = store.assertOwnProject(userId, projectId);
+      const project = assertOwnProject(userId, projectId);
       if (project.status !== 'ready') throw new HttpError(409, 'Le projet n’est pas prêt.');
       if (store.get("SELECT id FROM jobs WHERE project_id = ? AND status IN ('queued','running','publishing')", projectId)) throw new HttpError(409, 'Attends la fin de la génération avant de modifier les assets.');
       const root = path.join(projectRoot(config, userId, projectId), 'engine/public/game');
       await CHECK_PATH(root, folder, { directory: true, create: true });
       const relative = folder ? `${folder}/${file.originalname}` : file.originalname;
       const destination = await CHECK_PATH(root, relative);
-      if (await exists(destination)) throw new HttpError(409, 'Un fichier porte déjà ce nom. Renomme-le avant l’envoi.');
+      if (await FILE_EXISTS(destination)) throw new HttpError(409, 'Un fichier porte déjà ce nom. Renomme-le avant l’envoi.');
       const quota = storage(userId);
       if (quota.usedBytes + file.size > quota.limitBytes) throw new HttpError(413, 'Quota global d’assets de ton compte atteint.');
       let handle;
@@ -122,7 +123,7 @@ function createProjects({ store, config, entitlements = () => null }) {
   }
 
   async function download(userId, projectId, assetId) {
-    store.assertOwnProject(userId, projectId);
+    assertOwnProject(userId, projectId);
     const row = store.get('SELECT * FROM assets WHERE id = ? AND project_id = ?', assetId, projectId);
     if (!row) throw new HttpError(404, 'Fichier introuvable.');
     const root = path.join(projectRoot(config, userId, projectId), 'engine/public/game');
@@ -135,4 +136,4 @@ function createProjects({ store, config, entitlements = () => null }) {
 
 
 
-module.exports = { createProjects, projectRoot, CHECK_PATH, COPY_ENGINE };
+module.exports = { createProjects, projectRoot, UUID, CHECK_PATH, COPY_ENGINE, exists: FILE_EXISTS };

@@ -1,9 +1,11 @@
-const fs = require('node:fs');
+const fs = require('node:fs/promises');
+const path = require('node:path');
 const crypto = require('node:crypto');
+const { HttpError } = require('./errors');
 const { promisify } = require('node:util');
 const scrypt = promisify(crypto.scrypt);
 // -----------------------------------------------------------------------------------
-const { COOKIE_NAME, MIN_PASSWORD_LENGTH, MAX_NAME_LENGTH, SESSION_MS } = require('./constants');
+const { COOKIE_NAME, MIN_PASSWORD_LENGTH, MAX_NAME_LENGTH } = require('./constants');
 // -----------------------------------------------------------------------------------
 
 module.exports.PASSWORD_HASH = async (password, salt = crypto.randomBytes(16).toString('hex')) => {
@@ -15,7 +17,7 @@ module.exports.PASSWORD_HASH = async (password, salt = crypto.randomBytes(16).to
 module.exports.VERIFY_PASSWORD = async (password, stored) => {
   // 1. Si 'stored' est invalide ou mal formaté, on extrait un sel fictif pour exécuter scrypt
   // afin de simuler le temps de calcul (évite les attaques temporelles sur l'existence de l'utilisateur)
-  const isValidFormat = typeof stored === 'string' && stored.includes(':');
+  const isValidFormat = typeof stored === 'string' && /^[a-f0-9]{32}:[a-f0-9]{128}$/.test(stored);
   const [salt, originalHashHex] = isValidFormat ? stored.split(':') : [crypto.randomBytes(16).toString('hex'), ''];
 
   // 2. On calcule le hash du mot de passe fourni avec le sel trouvé (ou fictif)
@@ -58,12 +60,13 @@ module.exports.CREDENTIALS = (body, registering) => {
   return { email, password: body.password, name };
 }
 
-module.exports.COOKIE_TOKEN = (req) => {
-  const value = (req.headers.cookie || '').split(';').map(s => s.trim()).find(s => s.startsWith(`${COOKIE_NAME}=`))?.slice(COOKIE_NAME.length + 1);
+module.exports.COOKIE_TOKEN = (req, cookieName = COOKIE_NAME) => {
+  const value = (req.headers.cookie || '').split(';').map(s => s.trim()).find(s => s.startsWith(`${cookieName}=`))?.slice(cookieName.length + 1);
   return /^[a-f0-9]{64}$/.test(value || '') ? value : null;
 }
 
 module.exports.CHECK_PATH = async (root, relative, { directory = false, create = false } = {}) => {
+  if (typeof relative !== 'string') throw new HttpError(400, 'Chemin de fichier invalide.');
   const segments = relative ? relative.split('/') : [];
   if (segments.some(s => !s || s === '.' || s === '..' || s.startsWith('.') || /[\\\x00-\x1f\x7f:]/.test(s) || s.length > 100) || relative.length > 400) {
     throw new HttpError(400, 'Chemin de fichier invalide.');

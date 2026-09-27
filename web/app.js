@@ -1,14 +1,14 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const state = { session: null, projects: [], selected: null, jobs: [], registering: false,
-  pendingRequest: null, purchaseRequests: new Map(), budgetUserId: null, expandedPlans: new Set(),
+  pendingRequest: null, purchaseRequests: new Map(), budgetUserId: null,
   view: 'projects', epoch: 0, revision: 0, selection: 0, busy: false,
   stream: null, streamVersion: 0, reconnectTimer: null, heartbeatTimer: null, reconnectAttempt: 0, pageActive: true,
   logoutPending: null };
 const format = new Intl.NumberFormat('fr-FR');
 const date = value => new Date(value).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' });
-const statuses = { queued: 'En attente', running: 'Création en cours', succeeded: 'Appliquée', failed: 'Non facturée' };
-const phases = { planning: 'Analyse du prompt', coding: 'Écriture du jeu', validating: 'Vérification', publishing: 'Publication' };
+const statuses = { queued: 'En attente', running: 'En cours', succeeded: 'Appliquée', failed: 'Échec' };
+const phases = { coding: 'Écriture du jeu', validating: 'Vérification', publishing: 'Publication' };
 const usdFormat = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 6 });
 const usd = microUsd => `US$${usdFormat.format(microUsd / 1000000)}`;
 const generationMax = () => Number.isSafeInteger(state.session?.generationMaxCredits) && state.session.generationMaxCredits > 0 ? state.session.generationMaxCredits : 200;
@@ -112,8 +112,8 @@ function renderSession() {
   $('account-name').textContent = user.name;
   $('credit-balance').textContent = format.format(available);
   $('credit-reserved').textContent = user.reservedCredits ? `${format.format(user.reservedCredits)} crédit(s) réservé(s)` : 'Aucun crédit réservé';
-  $('ai-model').textContent = `OpenAI · ${session.aiModel || 'gpt-6-astra'}`;
-  $('credit-conversion').textContent = `1 crédit plateforme = ${usd(creditMicroUsd())} de budget OpenAI. Ce ne sont pas des tokens : une demande ne coûte pas forcément un crédit. Budget IA en USD, abonnements et packs facturés en EUR ; il ne s’agit pas d’un taux de change.`;
+  $('ai-model').textContent = `Aider · ${session.aiModel || 'anthropic/claude-sonnet-4-6'}`;
+  $('credit-conversion').textContent = `1 crédit plateforme = ${usd(creditMicroUsd())} de coût estimé par Aider, pas une facture fournisseur exacte. Ce ne sont pas des tokens : une demande ne coûte pas forcément un crédit. Estimation IA en USD, abonnements et packs facturés en EUR ; il ne s’agit pas d’un taux de change.`;
   $('generation-disabled').hidden = session.generationEnabled;
   $('billing-disabled').hidden = session.billingEnabled;
   renderStorage(); updateGenerate();
@@ -126,7 +126,7 @@ function updateGenerate() {
   const available = session?.user ? session.user.credits - session.user.reservedCredits : 0;
   $('generation-budget').max = String(generationMax());
   $('generation-budget').setAttribute('aria-invalid', String(budget === null));
-  $('generation-price').textContent = `1 crédit = ${usd(creditMicroUsd())} de budget OpenAI. ${budget === null ? 'Choisis un budget entier valide.' : `Plafond réservé : ${format.format(budget)} crédit(s), soit ${usd(budget * creditMicroUsd())}.`} Maximum : ${format.format(generationMax())} · disponibles : ${format.format(available)}.${budget !== null && available < budget ? ' Solde insuffisant pour ce plafond.' : ''}`;
+  $('generation-price').textContent = `1 crédit = ${usd(creditMicroUsd())} de coût estimé par Aider. ${budget === null ? 'Choisis un budget entier valide.' : `Plafond de débit réservé : ${format.format(budget)} crédit(s), soit ${usd(budget * creditMicroUsd())}.`} Maximum : ${format.format(generationMax())} · disponibles : ${format.format(available)}.${budget !== null && available < budget ? ' Solde insuffisant pour ce plafond.' : ''} Ce plafond limite les crédits débitables, pas les dépenses du fournisseur.`;
   $('generate').disabled = state.busy || !session?.user || !session.generationEnabled || !project || project.status !== 'ready' || active ||
     budget === null || available < budget;
   $('generate').textContent = state.busy ? 'Envoi en cours…' : active ? 'Génération en cours…' : 'Créer avec l’IA ↗';
@@ -164,7 +164,7 @@ async function loadProjects() {
   state.projects = data.projects; renderProjects();
 }
 async function selectProject(id) {
-  state.selection++; state.selected = id; state.jobs = []; state.busy = false; state.pendingRequest = null; state.expandedPlans.clear();
+  state.selection++; state.selected = id; state.jobs = []; state.busy = false; state.pendingRequest = null;
   $('prompt').value = ''; $('workbench').hidden = false;
   $('selected-project').textContent = state.projects.find(p => p.id === id)?.name || '';
   $('job-list').replaceChildren(el('p', 'hint', 'Chargement…'));
@@ -179,28 +179,23 @@ function renderJobs() {
   for (const job of state.jobs) {
     const item = el('article', 'job');
     const meta = el('div', 'job-meta');
-    const label = job.status === 'running' && Object.hasOwn(phases, job.phase) ? phases[job.phase] : statuses[job.status] || job.status;
-    meta.append(el('span', 'job-status ' + job.status, label), el('span', '', date(job.createdAt)));
+    meta.append(el('span', 'job-status ' + job.status, statuses[job.status] || job.status));
+    if (job.status === 'running' && Object.hasOwn(phases, job.phase)) meta.append(el('span', '', phases[job.phase]));
+    meta.append(el('span', '', date(job.createdAt)));
     const reserved = job.reservedCost ?? job.cost;
     const charged = job.chargedCredits ?? (job.status === 'succeeded' ? job.cost : 0);
     const accounting = job.status === 'succeeded' ? `${format.format(charged)} crédit(s) débité(s) · plafond ${format.format(reserved)} · ${format.format(Math.max(0, reserved - charged))} libéré(s)` :
       job.status === 'failed' ? `0 crédit débité · ${format.format(reserved)} crédit(s) libéré(s) (échec ou aucun changement publié)` : `${format.format(reserved)} crédit(s) réservé(s) · débit réel en attente`;
     item.append(meta, el('p', '', job.prompt));
-    if (typeof job.plan === 'string' && job.plan.trim()) {
-      const details = el('details', 'job-plan');
-      details.open = state.expandedPlans.has(job.id);
-      details.append(el('summary', '', 'Plan de création'), el('p', 'job-plan-text', job.plan));
-      details.addEventListener('toggle', () => {
-        if (details.open) state.expandedPlans.add(job.id);
-        else state.expandedPlans.delete(job.id);
-      });
-      item.append(details);
-    }
     item.append(el('p', 'hint', accounting));
-    if (job.providerCostMicroUsd !== null && job.providerCostMicroUsd !== undefined) {
-      item.append(el('p', 'hint', `Usage OpenAI : ${usd(job.providerCostMicroUsd)}${job.status === 'failed' ? ' · non facturé au client' : ''}`));
-    }
-    if (job.usage) {
+    const aider = job.costSource === 'aider';
+    // A zero default without an Aider usage record is not a reported estimate.
+    const hasCost = Number.isSafeInteger(job.providerCostMicroUsd) && job.providerCostMicroUsd >= 0 &&
+      (!aider || job.providerCostMicroUsd > 0 || job.usage);
+    if (hasCost) {
+      item.append(el('p', 'hint', `${aider ? 'Coût estimé par Aider' : 'Usage OpenAI historique'} : ${usd(job.providerCostMicroUsd)}${job.status === 'failed' ? ' · non facturé au client' : ''}`));
+    } else if (aider) item.append(el('p', 'hint', 'Coût estimé par Aider : indisponible'));
+    if (!aider && job.usage) {
       const usage = job.usage;
       item.append(el('p', 'hint', `Tokens — entrée : ${format.format(usage.inputTokens ?? 0)} · entrée en cache : ${format.format(usage.cachedInputTokens ?? 0)} · écriture du cache : ${format.format(usage.cacheWriteInputTokens ?? 0)} · sortie : ${format.format(usage.outputTokens ?? 0)} · raisonnement : ${format.format(usage.reasoningTokens ?? 0)} · requêtes : ${format.format(usage.requests ?? 0)}`));
     }
@@ -252,7 +247,7 @@ function stopEvents() {
 function clearAuth() {
   stopEvents(); state.epoch++; state.selection++; state.revision++;
   state.session = null; state.projects = []; state.selected = null; state.jobs = []; state.busy = false;
-  state.pendingRequest = null; state.purchaseRequests.clear(); state.expandedPlans.clear(); state.reconnectAttempt = 0;
+  state.pendingRequest = null; state.purchaseRequests.clear(); state.reconnectAttempt = 0;
   $('workbench').hidden = true; $('prompt').value = ''; $('asset-file').value = ''; connectionStatus.textContent = '';
   for (const id of ['asset-list', 'ledger', 'plan-list', 'credit-pack-list']) $(id).replaceChildren();
   for (const id of ['account-name', 'credit-balance', 'credit-reserved', 'wallet-available', 'wallet-reserved', 'subscription-status', 'selected-project']) $(id).textContent = '';
@@ -491,7 +486,7 @@ $('prompt-form').addEventListener('submit', async event => {
     await api(`/api/projects/${project}/generations`, { method: 'POST', body: { prompt, budgetCredits, requestId: state.pendingRequest.requestId } });
     if (!isCurrent(ticket, false)) return;
     state.pendingRequest = null; $('prompt').value = '';
-    notify('Demande reçue. Ton plafond est réservé ; seul l’usage OpenAI réel, arrondi au crédit supérieur, sera débité après publication réussie. Le reste sera libéré. Échec ou aucun changement : aucun débit.');
+    notify('Demande reçue. Ton budget est réservé ; le coût estimé par Aider en USD sera converti en crédits, arrondi au crédit supérieur, et débité après publication réussie. Le reste sera libéré. Échec, aucun changement publié, estimation manquante ou budget dépassé : aucun débit.');
     await Promise.all([loadJobs(project), refreshSession()]);
   } catch (error) {
     if (!isCurrent(ticket, false)) return;
@@ -529,7 +524,7 @@ document.addEventListener('visibilitychange', () => { if (document.hidden) suspe
 window.addEventListener('pagehide', () => { state.pageActive = false; suspendEvents(); });
 window.addEventListener('pageshow', () => { state.pageActive = true; startEvents(); });
 async function enterStudio() {
-  state.selection++; state.selected = null; state.jobs = []; state.purchaseRequests.clear(); state.expandedPlans.clear(); $('workbench').hidden = true;
+  state.selection++; state.selected = null; state.jobs = []; state.purchaseRequests.clear(); $('workbench').hidden = true;
   const ticket = readTicket();
   startEvents();
   await loadProjects();

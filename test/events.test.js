@@ -535,7 +535,7 @@ test('HTTP snapshots expose only the public protocol, latest 100 jobs and no cre
   assert.equal(data.projects.length, 1); assertKeys(data.projects[0], ['id', 'name', 'status', 'createdAt', 'updatedAt']);
   assert.equal(data.jobs.length, 100); assert.deepEqual(data.jobs.map(job => job.id), ids.slice(-100).reverse());
   for (const job of data.jobs) assertKeys(job, ['id', 'projectId', 'status', 'prompt', 'phase', 'plan', 'cost',
-    'reservedCost', 'chargedCredits', 'providerCostMicroUsd', 'usage', 'error', 'createdAt', 'completedAt']);
+    'reservedCost', 'chargedCredits', 'providerCostMicroUsd', 'costSource', 'usage', 'error', 'createdAt', 'completedAt']);
   assertKeys(data.wallet, ['balance', 'reserved', 'available', 'entries']);
   assertKeys(data.wallet.entries[0], ['id', 'kind', 'amount', 'reservedDelta', 'description', 'createdAt']);
   const wire = JSON.stringify(stream.frames);
