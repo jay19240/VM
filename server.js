@@ -1,5 +1,9 @@
 const { createApplication } = require('./server/app');
 
+// Local use only; no reverse proxy or tunnel. After an unclean crash, verify that
+// the old server AND its Aider container have stopped before manually removing
+// DATA_DIR/.server.lock. Never remove the lock while either can still write.
+
 async function start(options = {}) {
   const platform = await createApplication(options);
   let server;
@@ -9,17 +13,13 @@ async function start(options = {}) {
     if (!shutdownPromise) {
       shutdownPromise = (async () => {
         try {
-          // The application stops accepting work and ends SSE; this module owns HTTP.
-          await platform.beginShutdown();
+          // Abort and await generation first; closing HTTP first would wait on that request.
+          await platform.close();
         } finally {
-          try {
-            if (server) await new Promise((resolve, reject) => {
-              server.close(error => error && error.code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve());
-              server.closeIdleConnections();
-            });
-          } finally {
-            await platform.close();
-          }
+          if (server) await new Promise((resolve, reject) => {
+            server.close(error => error && error.code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve());
+            server.closeIdleConnections();
+          });
         }
       })().finally(() => {
         process.off('SIGTERM', onSignal);
@@ -44,7 +44,7 @@ async function start(options = {}) {
   }
 
   try {
-    server = platform.app.listen(platform.config.port, platform.config.host);
+    server = platform.app.listen(platform.config.port, '127.0.0.1');
     server.requestTimeout = 60000;
     server.headersTimeout = 15000;
     await new Promise((resolve, reject) => {
@@ -55,8 +55,8 @@ async function start(options = {}) {
       server.once('error', onListenError);
     });
     server.on('error', onServerError);
-    process.once('SIGTERM', onSignal);
-    process.once('SIGINT', onSignal);
+    process.on('SIGTERM', onSignal);
+    process.on('SIGINT', onSignal);
     console.log(`Legacy Studio écoute sur le port ${server.address().port}.`);
     return { ...platform, server, shutdown, close: shutdown };
   } catch (error) {
@@ -66,7 +66,7 @@ async function start(options = {}) {
 }
 
 if (require.main === module) start().catch(() => {
-  // Do not dump configuration, Stripe errors, auth payloads or child-process diagnostics.
+  // Never dump configuration, file paths or provider/child-process diagnostics.
   console.error('Démarrage impossible. Vérifie la configuration, le stockage et le verrou du serveur.');
   process.exitCode = 1;
 });
