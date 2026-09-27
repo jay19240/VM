@@ -8,28 +8,31 @@ const { createBilling } = require('./billing');
 const { createProjects, UUID } = require('./files');
 const { createJobs } = require('./jobs');
 const { createEvents } = require('./events');
-const { createAgentRunner } = require('./runner');
-const { createPricing } = require('./ai-pricing');
+const { createAider } = require('./aider');
+const { acquireLock } = require('./lock');
 const { loadConfig } = require('./config');
 const { HttpError } = require('./errors');
-const { CREATE_MIDDLEWARE_RATE_LIMIT, MIDDLEWARE_AUTH_LOAD, MIDDLEWARE_REQUIRE_USER, MIDDLEWARE_JSON_ONLY } = require('./middlewares');
+const { CREATE_MIDDLEWARE_RATE_LIMIT, MIDDLEWARE_REQUIRE_USER, MIDDLEWARE_JSON_ONLY } = require('./middlewares');
 // -----------------------------------------------------------------------------------
 
-const authLimit = CREATE_MIDDLEWARE_RATE_LIMIT(20, 15 * 60 * 1000);
-const projectsLimit = CREATE_MIDDLEWARE_RATE_LIMIT(10, 3600000, req => req.session.user_id);
-const generationLimit = CREATE_MIDDLEWARE_RATE_LIMIT(15, 3600000, req => req.session.user_id);
-const billingLimit = CREATE_MIDDLEWARE_RATE_LIMIT(15, 60000, req => req.session.user_id);
-
-async function createApplication({ config = loadConfig(), runner, lemonClient } = {}) {
-  const store = new Store(config.databasePath);
+async function createApplication({ config = loadConfig(), runner = createAider(config), lemonClient } = {}) {
+  const releaseLock = acquireLock(config.dataDir);
+  let store;
+  try {
+  store = new Store(config.databasePath);
+  const authLimit = CREATE_MIDDLEWARE_RATE_LIMIT(20, 15 * 60 * 1000);
+  const projectsLimit = CREATE_MIDDLEWARE_RATE_LIMIT(10, 3600000, req => req.session.user_id);
+  const generationLimit = CREATE_MIDDLEWARE_RATE_LIMIT(15, 3600000, req => req.session.user_id);
+  const billingLimit = CREATE_MIDDLEWARE_RATE_LIMIT(15, 60000, req => req.session.user_id);
   const billing = createBilling({ config, store, lemonClient });
-  const runner = createAgentRunner(config);
-  const pricing = { microUsdPerCredit: config.aiMicroUsdPerCredit, rates: createPricing(config).rates };
+  const pricing = { provider: 'aider', microUsdPerCredit: config.aiMicroUsdPerCredit };
   const jobs = createJobs({ store, config, runner });
+  await runner.initialize?.();
   await jobs.recover();
   const projects = createProjects({ store, config, entitlements: userId => billing.getEntitlements(userId) });
-  const auth = CREATE_AUTH(store);
+  const auth = CREATE_AUTH({ store, config, projects, runner, jobs, billing });
   const events = createEvents({ store });
+  let accepting = true;
 
   const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: config.maxAssetBytes, files: 1, fields: 1, fieldSize: 400, parts: 2 } });
   let uploads = 0;
@@ -56,7 +59,11 @@ async function createApplication({ config = loadConfig(), runner, lemonClient } 
     next();
   });
 
-  app.use('/api', (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
+  app.use('/api', (_req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    if (!accepting) throw new HttpError(503, 'Le serveur est en cours d’arrêt.');
+    next();
+  });
   app.post('/api/billing/webhook', express.raw({ type: 'application/json', limit: '1mb' }), async (req, res) => {
     await billing.webhook(req.body, req.get('x-signature'));
     res.json({ received: true });
@@ -74,7 +81,7 @@ async function createApplication({ config = loadConfig(), runner, lemonClient } 
   // AUTHENTICATION
   // -------------------------------------------------------------------------------------------
 
-  app.use('/api', (req, res, next) => MIDDLEWARE_AUTH_LOAD(req, res, next));
+  app.use('/api', auth.loadSession);
 
   app.post('/api/auth/register', authLimit, MIDDLEWARE_JSON_ONLY, async (req, res) => {
     await auth.register(req, res);
@@ -177,16 +184,20 @@ async function createApplication({ config = loadConfig(), runner, lemonClient } 
 
   app.get('/api/events', (req, res) => {
     const projectId = req.query.projectId ?? null;
-    if (!UUID.test(projectId)) {
+    if (Object.keys(req.query).some(key => key !== 'projectId') ||
+        (projectId !== null && (typeof projectId !== 'string' || !UUID.test(projectId)))) {
       throw new HttpError(400, 'Projet de suivi invalide.');
     }
-
+    if ((req.get('origin') && req.get('origin') !== config.appUrl) ||
+        (req.get('sec-fetch-site') && !['same-origin', 'none'].includes(req.get('sec-fetch-site')))) {
+      throw new HttpError(403, 'Origine de la requête non autorisée.');
+    }
     const userId = req.session.user_id;
-    store.assertOwnProject(userId, projectId);
+    if (projectId !== null) store.assertOwnProject(userId, projectId);
 
     events.open(req, res, () => {
-      store.assertOwnProject(userId, projectId);
-      const jobRows = store.all('SELECT * FROM jobs WHERE project_id = ? AND user_id = ? ORDER BY rowid DESC LIMIT 100', projectId, userId);
+      if (projectId !== null) store.assertOwnProject(userId, projectId);
+      const jobRows = projectId === null ? [] : store.all('SELECT * FROM jobs WHERE project_id = ? AND user_id = ? ORDER BY rowid DESC LIMIT 100', projectId, userId);
       const projectRows = store.all('SELECT * FROM projects WHERE user_id = ? ORDER BY created_at DESC', userId);
 
       return {
@@ -225,7 +236,7 @@ async function createApplication({ config = loadConfig(), runner, lemonClient } 
     res.json(await billing.checkout(req.session.user_id, req.body?.planId, req.body?.requestId));
   });
 
-  app.post('/api/billing/credit-checkout', billingLimit, jsonOnly, async (req, res) => {
+  app.post('/api/billing/credit-checkout', billingLimit, MIDDLEWARE_JSON_ONLY, async (req, res) => {
     res.json(await billing.purchaseCredits(req.session.user_id, req.body?.packId, req.body?.requestId));
   });
 
@@ -267,7 +278,7 @@ async function createApplication({ config = loadConfig(), runner, lemonClient } 
   let closed = false;
   let stopping = false;
 
-  async function beginShutdown() {
+  function beginShutdown() {
     if (stopping) {
       return;
     }
@@ -276,9 +287,6 @@ async function createApplication({ config = loadConfig(), runner, lemonClient } 
     accepting = false;
     jobs.pause();
     events.close();
-
-    await new Promise(resolve => { app.close(resolve); app.closeIdleConnections(); });
-    await platform.close();
   }
 
   async function close() {
@@ -291,6 +299,7 @@ async function createApplication({ config = loadConfig(), runner, lemonClient } 
     events.close();
     await jobs.close();
     store.close();
+    releaseLock();
   }
 
   return {
@@ -301,6 +310,11 @@ async function createApplication({ config = loadConfig(), runner, lemonClient } 
     beginShutdown,
     close
   };
+  } catch (error) {
+    store?.close();
+    releaseLock();
+    throw error;
+  }
 }
 
 module.exports = { createApplication };

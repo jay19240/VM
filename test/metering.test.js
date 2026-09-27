@@ -71,7 +71,7 @@ test('exact persisted cache/read/write/output costs count reasoning once and rel
   const finished = h.row(job.id); const view = jobView(finished);
   assert.equal(finished.status, 'succeeded'); assert.equal(finished.actual_cost, 2);
   assert.equal(view.cost, 2); assert.equal(view.chargedCredits, 2); assert.equal(view.reservedCost, 10);
-  assert.equal(view.providerCostMicroUsd, 1395);
+  assert.equal(view.providerCostMicroUsd, 1395); assert.equal(view.costSource, 'legacy');
   assert.deepEqual(view.usage, JSON.parse(finished.usage_json));
   assert.equal(h.wallet().balance, 98); assert.equal(h.wallet().reserved, 0); assert.equal(h.wallet().available, 98);
   const entry = h.wallet().entries[0];
@@ -83,7 +83,7 @@ test('exact persisted cache/read/write/output costs count reasoning once and rel
   assert.equal(await h.store.recordUsage(job.id, usage), false);
   assert.deepEqual(h.wallet(), before); assert.deepEqual(h.row(job.id), finished);
   assert.deepEqual(Object.keys(view).sort(), ['id', 'projectId', 'status', 'prompt', 'cost', 'reservedCost',
-    'chargedCredits', 'providerCostMicroUsd', 'usage', 'error', 'createdAt', 'completedAt', 'phase', 'plan'].sort());
+    'chargedCredits', 'providerCostMicroUsd', 'costSource', 'usage', 'error', 'createdAt', 'completedAt', 'phase', 'plan'].sort());
   const exposed = JSON.stringify(view);
   for (const privateValue of [usage.responseId, usage.model, 'costNumerator', 'pricing_json', 'password_hash', 'rates']) {
     assert.ok(!exposed.includes(privateValue));

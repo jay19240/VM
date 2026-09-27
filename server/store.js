@@ -5,12 +5,20 @@ const { HttpError } = require('./errors');
 const { createPricing, ceilDiv, safeNumber, DENOMINATOR } = require('./ai-pricing');
 const timestamp = () => new Date().toISOString();
 const TOKEN_FIELDS = ['inputTokens', 'cachedInputTokens', 'cacheWriteInputTokens', 'outputTokens', 'reasoningTokens'];
+const AIDER_USAGE_FIELDS = ['costMicroUsd', 'inputTokens', 'outputTokens', 'requests'];
 function integer(value, min = 0, max = Number.MAX_SAFE_INTEGER) {
   if (!Number.isSafeInteger(value) || value < min || value > max) throw new Error('Invalid AI accounting integer');
   return value;
 }
 function snapshotPricing(snapshot) {
   const microUsdPerCredit = integer(snapshot?.microUsdPerCredit, 1);
+  if (snapshot?.provider === 'aider') {
+    if (Object.keys(snapshot).some(key => !['provider', 'microUsdPerCredit'].includes(key))) {
+      throw new Error('Invalid Aider pricing snapshot');
+    }
+    return { provider: 'aider', microUsdPerCredit };
+  }
+  if (snapshot?.provider !== undefined) throw new Error('Invalid AI pricing provider');
   const rates = snapshot?.rates;
   const pricing = createPricing({ aiMicroUsdPerCredit: microUsdPerCredit,
     openaiInputMicroUsdPerMillion: integer(rates?.inputMicroUsdPerMillion, 1),
@@ -23,6 +31,31 @@ function snapshotPricing(snapshot) {
 function storedPricing(job) {
   if (job.billing_mode !== 'metered') throw new Error('Job is not metered');
   return snapshotPricing({ microUsdPerCredit: job.micro_usd_per_credit, rates: JSON.parse(job.pricing_json) });
+}
+function storedAiderPricing(job) {
+  const snapshot = JSON.parse(job.pricing_json);
+  if (job.billing_mode !== 'metered' || snapshot?.provider !== 'aider' || Object.keys(snapshot).length !== 1) {
+    throw new Error('Invalid Aider pricing snapshot');
+  }
+  return { microUsdPerCredit: integer(job.micro_usd_per_credit, 1) };
+}
+function canonicalAiderUsage(record) {
+  if (!record || typeof record !== 'object' ||
+      ![Object.prototype, null].includes(Object.getPrototypeOf(record))) throw new Error('Invalid Aider usage record');
+  const fields = Object.getOwnPropertyDescriptors(record);
+  if (Reflect.ownKeys(fields).length !== AIDER_USAGE_FIELDS.length ||
+      Reflect.ownKeys(fields).some(key => !AIDER_USAGE_FIELDS.includes(key) || !Object.hasOwn(fields[key], 'value'))) {
+    throw new Error('Invalid Aider usage fields');
+  }
+  return Object.fromEntries(AIDER_USAGE_FIELDS.map(key => [key, integer(fields[key].value, key === 'requests' ? 1 : 0)]));
+}
+function aiderAccounting(job) {
+  const { microUsdPerCredit } = storedAiderPricing(job);
+  const usage = JSON.parse(job.usage_json);
+  if (!usage || typeof usage !== 'object' || Object.keys(usage).length !== 3 || Object.hasOwn(usage, 'costMicroUsd')) {
+    throw new Error('Cannot publish without valid AI usage');
+  }
+  return { microUsdPerCredit, record: canonicalAiderUsage({ ...usage, costMicroUsd: job.provider_cost_micro_usd }) };
 }
 function canonicalUsage(record, pricing) {
   const fields = ['responseId', 'model', ...TOKEN_FIELDS, 'longContext', 'costMicroUsd', 'costNumerator', 'costDenominator', 'rates'];
@@ -66,6 +99,13 @@ function usageAccounting(store, job) {
 }
 function publicationCharge(store, job) {
   if (job.billing_mode === 'fixed') return job.cost;
+  if (JSON.parse(job.pricing_json)?.provider === 'aider') {
+    const { record, microUsdPerCredit } = aiderAccounting(job);
+    // Aider reports a cumulative, rounded-up session estimate, not legacy token-rate costs.
+    const charge = ceilDiv(BigInt(record.costMicroUsd), BigInt(microUsdPerCredit));
+    if (charge > BigInt(job.cost)) throw new Error('AI usage exceeds reserved budget');
+    return safeNumber(charge);
+  }
   const accounting = usageAccounting(store, job);
   if (!accounting.usage.requests) throw new Error('Cannot publish without valid AI usage');
   const charge = ceilDiv(accounting.numerator, DENOMINATOR * BigInt(accounting.microUsdPerCredit));
@@ -81,6 +121,7 @@ const jobView = row => row && ({ id: row.id, projectId: row.project_id,
   phase: row.status === 'publishing' ? 'publishing' : row.agent_phase ?? null, plan: row.agent_plan ?? null,
   cost: row.actual_cost ?? row.cost, reservedCost: row.cost, chargedCredits: row.actual_cost ?? null,
   providerCostMicroUsd: row.provider_cost_micro_usd ?? 0, usage: JSON.parse(row.usage_json ?? 'null'),
+  costSource: JSON.parse(row.pricing_json ?? 'null')?.provider === 'aider' ? 'aider' : 'legacy',
   error: row.error, createdAt: row.created_at, completedAt: row.completed_at });
 
 class Store {
@@ -206,7 +247,142 @@ class Store {
     });
   }
 
+  assertOwnProject(userId, id) {
+    const row = this.get('SELECT * FROM projects WHERE id = ? AND user_id = ?', id, userId);
+    if (!row) throw new HttpError(404, 'Projet introuvable.');
+    return row;
+  }
+  ownProject(userId, id) { return this.assertOwnProject(userId, id); }
 
+  reserveJob(userId, projectId, requestId, prompt, cost, pricing) {
+    integer(cost, 1, 9000000000000);
+    return this.transaction(() => {
+      const project = this.ownProject(userId, projectId);
+      const existing = this.get('SELECT * FROM jobs WHERE user_id = ? AND request_id = ?', userId, requestId);
+      if (existing) {
+        if (existing.project_id !== projectId || existing.prompt !== prompt || existing.cost !== cost) throw new HttpError(409, 'Cette demande a déjà été utilisée pour une autre génération.');
+        return existing;
+      }
+      // Retries retain their original billing mode and snapshot, even after config changes.
+      const snapshot = pricing === undefined ? null : snapshotPricing(pricing);
+      if (project.status !== 'ready') throw new HttpError(409, 'Le projet n’est pas prêt.');
+      if (this.get("SELECT id FROM jobs WHERE project_id = ? AND status IN ('queued','running','publishing')", projectId)) {
+        throw new HttpError(409, 'Une génération est déjà en cours pour ce projet.');
+      }
+      if (this.run('UPDATE users SET reserved = reserved + ? WHERE id = ? AND credits - reserved >= ?', cost, userId, cost).changes !== 1) {
+        throw new HttpError(402, 'Crédits disponibles insuffisants.', 'INSUFFICIENT_CREDITS');
+      }
+      const id = randomUUID();
+      this.run(`INSERT INTO jobs(id,user_id,project_id,request_id,prompt,cost,status,created_at,
+        billing_mode,micro_usd_per_credit,pricing_json) VALUES (?,?,?,?,?,?,'queued',?,?,?,?)`,
+      id, userId, projectId, requestId, prompt, cost, timestamp(), snapshot ? 'metered' : 'fixed',
+      snapshot?.microUsdPerCredit ?? null,
+      snapshot ? JSON.stringify(snapshot.provider === 'aider' ? { provider: 'aider' } : snapshot.rates) : null);
+      this.entry(userId, 0, cost, 'reservation', `job:${id}:reserve`, `${cost} crédit(s) réservé(s) pour une génération`);
+      return this.get('SELECT * FROM jobs WHERE id = ?', id);
+    });
+  }
+
+  updateJobProgress(jobId, progress) {
+    if (!progress || typeof progress !== 'object' ||
+        ![Object.prototype, null].includes(Object.getPrototypeOf(progress))) throw new Error('Invalid agent progress');
+    const fields = Object.getOwnPropertyDescriptors(progress);
+    if (Reflect.ownKeys(fields).some(key => !['phase', 'plan'].includes(key) || !Object.hasOwn(fields[key], 'value')) ||
+        !Object.hasOwn(fields, 'phase')) throw new Error('Invalid agent progress fields');
+    const phase = fields.phase.value;
+    const hasPlan = Object.hasOwn(fields, 'plan');
+    const plan = hasPlan ? fields.plan.value : undefined;
+    if (!['planning', 'coding', 'validating'].includes(phase)) throw new Error('Invalid agent phase');
+    // Only a public preparation summary belongs here, never private reasoning or provider logs.
+    if (hasPlan && (phase !== 'coding' || typeof plan !== 'string' || !plan.trim() ||
+        !plan.isWellFormed() || Buffer.byteLength(plan, 'utf8') > 8192 ||
+        /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(plan))) throw new Error('Invalid agent plan');
+    // Synchronous durable callback, including the running-state and immutable-plan checks.
+    return this.transaction(() => {
+      const job = this.get('SELECT * FROM jobs WHERE id = ?', jobId);
+      if (!job) throw new Error('Unknown job');
+      if (job.status !== 'running') throw new Error('Cannot update progress for a job that is not running');
+      if (hasPlan && job.agent_plan !== null && job.agent_plan !== plan) throw new Error('Conflicting agent plan');
+      const nextPlan = hasPlan ? plan : job.agent_plan;
+      if (job.agent_phase === phase && job.agent_plan === nextPlan) return false;
+      this.run('UPDATE jobs SET agent_phase = ?, agent_plan = ? WHERE id = ?', phase, nextPlan, jobId);
+      return true;
+    });
+  }
+
+  preparePublication(jobId) {
+    return this.transaction(() => {
+      const job = this.get('SELECT * FROM jobs WHERE id = ?', jobId);
+      if (!job) throw new Error('Unknown job');
+      if (job.status === 'succeeded') return job;
+      if (!['running', 'publishing'].includes(job.status)) throw new Error('Cannot publish a job that is not running');
+      publicationCharge(this, job); // Validate before any filesystem publication, without debiting.
+      if (job.status === 'running') this.run("UPDATE jobs SET status = 'publishing' WHERE id = ?", jobId);
+      return this.get('SELECT * FROM jobs WHERE id = ?', jobId);
+    });
+  }
+
+  finishJob(id, success, error = null) {
+    return this.transaction(() => {
+      const job = this.get('SELECT * FROM jobs WHERE id = ?', id);
+      if (!job || ['succeeded', 'failed'].includes(job.status)) return;
+      if (success && job.status !== 'publishing') throw new Error('Cannot charge unpublished job');
+      const charge = success ? publicationCharge(this, job) : 0;
+      this.run('UPDATE users SET reserved = reserved - ?, credits = credits - ? WHERE id = ?', job.cost, charge, job.user_id);
+      this.entry(job.user_id, -charge, -job.cost, success ? 'generation' : 'release', `job:${id}:finish`,
+        success ? 'Génération appliquée au projet' : 'Réservation annulée — génération non facturée');
+      this.run('UPDATE jobs SET status = ?, error = ?, completed_at = ?, actual_cost = ? WHERE id = ?',
+        success ? 'succeeded' : 'failed', error, timestamp(), charge, id);
+      if (success) this.run('UPDATE projects SET updated_at = ? WHERE id = ?', timestamp(), job.project_id);
+    });
+  }
+
+  recordUsage(jobId, record) {
+    // Synchronous durable callback; callers may also await its boolean result.
+    return this.transaction(() => {
+      const job = this.get('SELECT * FROM jobs WHERE id = ?', jobId);
+      if (!job) throw new Error('Unknown job');
+      const canonical = canonicalUsage(record, storedPricing(job).pricing);
+      const json = JSON.stringify(canonical);
+      const existing = this.get('SELECT * FROM ai_usage WHERE response_id = ?', canonical.responseId);
+      if (existing) {
+        if (existing.job_id !== jobId || existing.record_json !== json) throw new Error('Conflicting AI response identifier');
+        return false;
+      }
+      if (job.status !== 'running') throw new Error('Cannot record usage for a job that is not running');
+      this.run(`INSERT INTO ai_usage(response_id,job_id,model,record_json,cost_numerator,created_at)
+        VALUES (?,?,?,?,?,?)`, canonical.responseId, jobId, canonical.model, json, canonical.costNumerator, timestamp());
+      const accounting = usageAccounting(this, job);
+      this.run('UPDATE jobs SET provider_cost_micro_usd = ?, usage_json = ? WHERE id = ?',
+        accounting.providerCostMicroUsd, JSON.stringify(accounting.usage), jobId);
+      return true;
+    });
+  }
+
+  recordAiderUsage(jobId, record) {
+    return this.transaction(() => {
+      const job = this.get('SELECT * FROM jobs WHERE id = ?', jobId);
+      if (!job) throw new Error('Unknown job');
+      if (job.status !== 'running') throw new Error('Cannot record usage for a job that is not running');
+      storedAiderPricing(job);
+      const canonical = canonicalAiderUsage(record);
+      if (job.usage_json !== null) {
+        const previous = aiderAccounting(job).record;
+        if (canonical.requests === previous.requests) {
+          if (AIDER_USAGE_FIELDS.some(key => canonical[key] !== previous[key])) throw new Error('Conflicting Aider usage for request count');
+          return false;
+        }
+        if (AIDER_USAGE_FIELDS.some(key => canonical[key] < previous[key])) throw new Error('Decreasing Aider usage');
+      } else if (job.provider_cost_micro_usd !== 0) {
+        throw new Error('Conflicting persisted Aider usage');
+      }
+      // Record even over-budget estimates for diagnostics; only publication may debit credits.
+      const { costMicroUsd, inputTokens, outputTokens, requests } = canonical;
+      this.run('UPDATE jobs SET provider_cost_micro_usd = ?, usage_json = ? WHERE id = ?',
+        costMicroUsd, JSON.stringify({ inputTokens, outputTokens, requests }), jobId);
+      return true;
+    });
+  }
 
   wallet(userId) {
     const user = this.get('SELECT credits,reserved FROM users WHERE id = ?', userId);
