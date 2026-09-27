@@ -1,38 +1,19 @@
-'use strict';
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+// -----------------------------------------------------------------------------------
 const { HttpError } = require('./errors');
 const { timestamp } = require('./store');
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const exists = async filename => { try { await fs.lstat(filename); return true; } catch (e) { if (e.code === 'ENOENT') return false; throw e; } };
+const { UUID } = require('./constants');
+// -----------------------------------------------------------------------------------
+
 
 function projectRoot(config, userId, projectId) {
   if (!UUID.test(userId) || !UUID.test(projectId)) throw new HttpError(404, 'Projet introuvable.');
   return path.join(config.dataDir, 'users', userId, projectId);
 }
-async function checkPath(root, relative, { directory = false, create = false } = {}) {
-  const segments = relative ? relative.split('/') : [];
-  if (segments.some(s => !s || s === '.' || s === '..' || s.startsWith('.') || /[\\\x00-\x1f\x7f:]/.test(s) || s.length > 100) || relative.length > 400) {
-    throw new HttpError(400, 'Chemin de fichier invalide.');
-  }
-  const base = await fs.lstat(root);
-  if (!base.isDirectory() || base.isSymbolicLink()) throw new HttpError(400, 'Répertoire non autorisé.');
-  let current = root;
-  for (let i = 0; i < segments.length; i++) {
-    current = path.join(current, segments[i]);
-    const wantsDir = directory || i < segments.length - 1;
-    if (create && wantsDir) await fs.mkdir(current, { mode: 0o755 }).catch(e => { if (e.code !== 'EEXIST') throw e; });
-    try {
-      const stat = await fs.lstat(current);
-      if (stat.isSymbolicLink() || (wantsDir ? !stat.isDirectory() : !stat.isFile())) throw new HttpError(400, 'Chemin de fichier non autorisé.');
-    } catch (error) {
-      if (error.code !== 'ENOENT' || wantsDir) throw error;
-    }
-  }
-  return current;
-}
-async function copyEngine(source, destination) {
+
+async function COPY_ENGINE(source, destination) {
   // The template is never written. Exclude dependencies/builds and private tool/auth configuration.
   await fs.cp(source, destination, { recursive: true, force: false, errorOnExist: true,
     filter: async filename => {
@@ -44,6 +25,7 @@ async function copyEngine(source, destination) {
       return true;
     } });
 }
+
 function createProjects({ store, config, entitlements = () => null }) {
   const queues = new Map();
   async function exclusive(id, fn) {
@@ -60,6 +42,17 @@ function createProjects({ store, config, entitlements = () => null }) {
       limitBytes: plan?.assetQuotaBytes ?? config.maxUserAssetBytes,
       maxProjects: plan?.maxProjects ?? config.maxProjects };
   }
+
+  function assertOwnProject(userId, id) {
+    const row = this.get('SELECT * FROM projects WHERE id = ? AND user_id = ?', id, userId);
+    if (!row) throw new HttpError(404, 'Projet introuvable.');
+    return row;
+  }
+
+  function getByUserID(userId) {
+    return store.all('SELECT * FROM projects WHERE user_id = ? ORDER BY created_at DESC', userId);
+  }
+
   async function create(userId, name) {
     if (typeof name !== 'string' || !name.trim() || name.trim().length > 80) throw new HttpError(400, 'Le nom du projet doit contenir de 1 à 80 caractères.');
     const id = randomUUID();
@@ -71,12 +64,12 @@ function createProjects({ store, config, entitlements = () => null }) {
     const root = projectRoot(config, userId, id);
     try {
       await fs.mkdir(root, { recursive: true, mode: 0o700 });
-      await copyEngine(config.engineDir, path.join(root, 'engine'));
+      await COPY_ENGINE(config.engineDir, path.join(root, 'engine'));
       await fs.mkdir(path.join(root, 'engine/public/game'), { recursive: true, mode: 0o755 });
       const game = await fs.lstat(path.join(root, 'engine/src/game'));
       if (!game.isDirectory() || game.isSymbolicLink()) throw new Error('Invalid game template');
       store.run("UPDATE projects SET status = 'ready', updated_at = ? WHERE id = ?", timestamp(), id);
-      return store.ownProject(userId, id);
+      return store.assertOwnProject(userId, id);
     } catch {
       store.run("UPDATE projects SET status = 'failed' WHERE id = ?", id);
       throw new HttpError(500, 'La copie du moteur a échoué. Le projet est conservé pour diagnostic.');
@@ -96,13 +89,13 @@ function createProjects({ store, config, entitlements = () => null }) {
     }
     // Serialize uploads across every project of one owner as well as against that project's generation.
     return exclusive(`assets:${userId}`, () => exclusive(projectId, async () => {
-      const project = store.ownProject(userId, projectId);
+      const project = store.assertOwnProject(userId, projectId);
       if (project.status !== 'ready') throw new HttpError(409, 'Le projet n’est pas prêt.');
       if (store.get("SELECT id FROM jobs WHERE project_id = ? AND status IN ('queued','running','publishing')", projectId)) throw new HttpError(409, 'Attends la fin de la génération avant de modifier les assets.');
       const root = path.join(projectRoot(config, userId, projectId), 'engine/public/game');
-      await checkPath(root, folder, { directory: true, create: true });
+      await CHECK_PATH(root, folder, { directory: true, create: true });
       const relative = folder ? `${folder}/${file.originalname}` : file.originalname;
-      const destination = await checkPath(root, relative);
+      const destination = await CHECK_PATH(root, relative);
       if (await exists(destination)) throw new HttpError(409, 'Un fichier porte déjà ce nom. Renomme-le avant l’envoi.');
       const quota = storage(userId);
       if (quota.usedBytes + file.size > quota.limitBytes) throw new HttpError(413, 'Quota global d’assets de ton compte atteint.');
@@ -127,13 +120,19 @@ function createProjects({ store, config, entitlements = () => null }) {
       return assetView(store.get('SELECT * FROM assets WHERE id = ?', id));
     }));
   }
+
   async function download(userId, projectId, assetId) {
-    store.ownProject(userId, projectId);
+    store.assertOwnProject(userId, projectId);
     const row = store.get('SELECT * FROM assets WHERE id = ? AND project_id = ?', assetId, projectId);
     if (!row) throw new HttpError(404, 'Fichier introuvable.');
     const root = path.join(projectRoot(config, userId, projectId), 'engine/public/game');
-    return { filename: row.filename, path: await checkPath(root, row.folder ? `${row.folder}/${row.filename}` : row.filename) };
+    return { filename: row.filename, path: await CHECK_PATH(root, row.folder ? `${row.folder}/${row.filename}` : row.filename) };
   }
-  return { create, listAssets, upload, download, exclusive, storage };
+
+  return { create, assertOwnProject, getByUserID, listAssets, upload, download, exclusive, storage };
 }
-module.exports = { createProjects, projectRoot, checkPath, copyEngine, exists, UUID };
+
+
+
+
+module.exports = { createProjects, projectRoot, CHECK_PATH, COPY_ENGINE };

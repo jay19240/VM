@@ -71,6 +71,115 @@ function createJobs({ store, config, runner }) {
     return { root, work, engine: path.join(root, 'engine'), live: path.join(root, 'engine/src/game'),
       draft: path.join(work, 'game'), backup: path.join(work, 'previous') };
   }
+
+  function reserveJob(userId, projectId, requestId, prompt, cost, pricing) {
+    integer(cost, 1, 9000000000000);
+    return this.transaction(() => {
+      const project = this.ownProject(userId, projectId);
+      const existing = this.get('SELECT * FROM jobs WHERE user_id = ? AND request_id = ?', userId, requestId);
+      if (existing) {
+        if (existing.project_id !== projectId || existing.prompt !== prompt || existing.cost !== cost) throw new HttpError(409, 'Cette demande a déjà été utilisée pour une autre génération.');
+        return existing;
+      }
+      // Retries retain their original billing mode and snapshot, even after config changes.
+      const snapshot = pricing === undefined ? null : snapshotPricing(pricing);
+      if (project.status !== 'ready') throw new HttpError(409, 'Le projet n’est pas prêt.');
+      if (this.get("SELECT id FROM jobs WHERE project_id = ? AND status IN ('queued','running','publishing')", projectId)) {
+        throw new HttpError(409, 'Une génération est déjà en cours pour ce projet.');
+      }
+      if (this.run('UPDATE users SET reserved = reserved + ? WHERE id = ? AND credits - reserved >= ?', cost, userId, cost).changes !== 1) {
+        throw new HttpError(402, 'Crédits disponibles insuffisants.', 'INSUFFICIENT_CREDITS');
+      }
+      const id = randomUUID();
+      this.run(`INSERT INTO jobs(id,user_id,project_id,request_id,prompt,cost,status,created_at,
+        billing_mode,micro_usd_per_credit,pricing_json) VALUES (?,?,?,?,?,?,'queued',?,?,?,?)`,
+      id, userId, projectId, requestId, prompt, cost, timestamp(), snapshot ? 'metered' : 'fixed',
+      snapshot?.microUsdPerCredit ?? null, snapshot ? JSON.stringify(snapshot.rates) : null);
+      this.entry(userId, 0, cost, 'reservation', `job:${id}:reserve`, `${cost} crédit(s) réservé(s) pour une génération`);
+      return this.get('SELECT * FROM jobs WHERE id = ?', id);
+    });
+  }
+  
+  function updateJobProgress(jobId, progress) {
+    if (!progress || typeof progress !== 'object' ||
+        ![Object.prototype, null].includes(Object.getPrototypeOf(progress))) throw new Error('Invalid agent progress');
+    const fields = Object.getOwnPropertyDescriptors(progress);
+    if (Reflect.ownKeys(fields).some(key => !['phase', 'plan'].includes(key) || !Object.hasOwn(fields[key], 'value')) ||
+        !Object.hasOwn(fields, 'phase')) throw new Error('Invalid agent progress fields');
+    const phase = fields.phase.value;
+    const hasPlan = Object.hasOwn(fields, 'plan');
+    const plan = hasPlan ? fields.plan.value : undefined;
+    if (!['planning', 'coding', 'validating'].includes(phase)) throw new Error('Invalid agent phase');
+    // Only a public preparation summary belongs here, never private reasoning or provider logs.
+    if (hasPlan && (phase !== 'coding' || typeof plan !== 'string' || !plan.trim() ||
+        !plan.isWellFormed() || Buffer.byteLength(plan, 'utf8') > 8192 ||
+        /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(plan))) throw new Error('Invalid agent plan');
+    // Synchronous durable callback, including the running-state and immutable-plan checks.
+    return this.transaction(() => {
+      const job = this.get('SELECT * FROM jobs WHERE id = ?', jobId);
+      if (!job) throw new Error('Unknown job');
+      if (job.status !== 'running') throw new Error('Cannot update progress for a job that is not running');
+      if (hasPlan && job.agent_plan !== null && job.agent_plan !== plan) throw new Error('Conflicting agent plan');
+      const nextPlan = hasPlan ? plan : job.agent_plan;
+      if (job.agent_phase === phase && job.agent_plan === nextPlan) return false;
+      this.run('UPDATE jobs SET agent_phase = ?, agent_plan = ? WHERE id = ?', phase, nextPlan, jobId);
+      return true;
+    });
+  }
+
+  function preparePublication(jobId) {
+    return this.transaction(() => {
+      const job = this.get('SELECT * FROM jobs WHERE id = ?', jobId);
+      if (!job) throw new Error('Unknown job');
+      if (job.status === 'succeeded') return job;
+      if (!['running', 'publishing'].includes(job.status)) throw new Error('Cannot publish a job that is not running');
+      publicationCharge(this, job); // Validate before any filesystem publication, without debiting.
+      if (job.status === 'running') this.run("UPDATE jobs SET status = 'publishing' WHERE id = ?", jobId);
+      return this.get('SELECT * FROM jobs WHERE id = ?', jobId);
+    });
+  }
+  
+  function finishJob(id, success, error = null) {
+    return this.transaction(() => {
+      const job = this.get('SELECT * FROM jobs WHERE id = ?', id);
+      if (!job || ['succeeded', 'failed'].includes(job.status)) return;
+      if (success && job.status !== 'publishing') throw new Error('Cannot charge unpublished job');
+      const charge = success ? publicationCharge(this, job) : 0;
+      this.run('UPDATE users SET reserved = reserved - ?, credits = credits - ? WHERE id = ?', job.cost, charge, job.user_id);
+      this.entry(job.user_id, -charge, -job.cost, success ? 'generation' : 'release', `job:${id}:finish`,
+        success ? 'Génération appliquée au projet' : 'Réservation annulée — génération non facturée');
+      this.run('UPDATE jobs SET status = ?, error = ?, completed_at = ?, actual_cost = ? WHERE id = ?',
+        success ? 'succeeded' : 'failed', error, timestamp(), charge, id);
+      if (success) this.run('UPDATE projects SET updated_at = ? WHERE id = ?', timestamp(), job.project_id);
+    });
+  }
+
+  function recordUsage(jobId, record) {
+    // Synchronous durable callback; callers may also await its boolean result.
+    return this.transaction(() => {
+      const job = this.get('SELECT * FROM jobs WHERE id = ?', jobId);
+      if (!job) throw new Error('Unknown job');
+      const canonical = canonicalUsage(record, storedPricing(job).pricing);
+      const json = JSON.stringify(canonical);
+      const existing = this.get('SELECT * FROM ai_usage WHERE response_id = ?', canonical.responseId);
+      if (existing) {
+        if (existing.job_id !== jobId || existing.record_json !== json) throw new Error('Conflicting AI response identifier');
+        return false;
+      }
+      if (job.status !== 'running') throw new Error('Cannot record usage for a job that is not running');
+      this.run(`INSERT INTO ai_usage(response_id,job_id,model,record_json,cost_numerator,created_at)
+        VALUES (?,?,?,?,?,?)`, canonical.responseId, jobId, canonical.model, json, canonical.costNumerator, timestamp());
+      const accounting = usageAccounting(this, job);
+      this.run('UPDATE jobs SET provider_cost_micro_usd = ?, usage_json = ? WHERE id = ?',
+        accounting.providerCostMicroUsd, JSON.stringify(accounting.usage), jobId);
+      return true;
+    });
+  }
+
+  function getByProjectID(projectId) {
+    return store.all('SELECT * FROM jobs WHERE project_id = ? ORDER BY rowid DESC LIMIT 100', projectId);
+  }
+
   async function recover() {
     // Called only while holding the exclusive server data-directory lock.
     store.run("UPDATE projects SET status = 'failed' WHERE status = 'provisioning'");
@@ -148,7 +257,7 @@ function createJobs({ store, config, runner }) {
       }
     } finally { pumping = false; }
   }
-  return { recover, get available() { return !stopped; }, pause() { stopped = true; },
+  return { recover, get available() { return !stopped; }, pause() { stopped = true; }, getByProjectID,
     kick: () => setImmediate(pump), async close() {
       stopped = true;
       for (const value of active.values()) value.controller.abort();
